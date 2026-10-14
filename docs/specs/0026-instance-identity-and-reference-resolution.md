@@ -232,8 +232,9 @@ principle 6.
 
 Each sub-task is one commit that leaves `main` working, with its tests. They
 are ordered so that how instances are held changes before who resolves
-references, and both before the constructor contract narrows. The last one
-tidies a field the earlier ones leave wider than it needs to be.
+references, and both before the constructor contract narrows. Sub-Task 10
+tidies a field the earlier ones leave wider than it needs to be, and Sub-Task
+11 adds a repair for the settings problems that Sub-Task 8 starts reporting.
 
 ---
 
@@ -523,12 +524,18 @@ gets the same instance for a given id, and a write ends the snapshot.
 
 **Expected Outcomes**
 
-`AppContext` owns the four sources, builds them on the first ask and hands out
-handles. Its `config` field becomes private: reads go through an accessor and
-writes through a second one that discards the set before returning the mutable
-reference, so a command cannot mutate configuration without invalidating what
-was built from it. Every call site that builds a source from `ctx.config`
-today asks the context instead.
+`AppContext` owns the provider, model and capability sources, builds them on
+the first ask and hands out handles. The launcher source joins them in
+Sub-Task 8, which is the first to read it. It moves out of `src/main.rs` into a module of its own, so its
+`config` field is private to that module: in the crate root a private field is
+visible to the whole crate. Reads go through an accessor and writes through a
+second one that discards the set before returning the mutable reference, so a
+command cannot mutate configuration without invalidating what was built from
+it. Every call site that builds a source from `ctx.config` today asks the
+context instead, and every direct use of the field goes through the
+accessors. The constructors that build a source on its own are left with test
+callers only, and become test-only, so a command can get a source only from
+the context.
 
 The session proxy handle lives on the context for the same reason, and setting
 it discards the set, so the providers handed out after a launch starts its
@@ -547,7 +554,7 @@ at the proxy where the previous set pointed at the upstream.
   `src/utils/ui/app.rs` (the call sites that build a source per command)
 - `src/config/mod.rs` (`insert_*`, `remove_*`, `update_*`, `model_proxy`)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -565,43 +572,44 @@ configuration and registry metadata, so it reports settings it cannot read and
 a model that does not meet its capability's requirement next to a name that
 resolves to nothing. It keeps its shape, its referrer bookkeeping and all
 of its command-layer callers: the list annotations, the remediation prompt and
-the launch's prelaunch check. Asking who points at an instance stays a
+the launch's prelaunch check. Each hop builds an instance with the same call a
+command makes to use it, and only after what the instance points at has been
+checked: building a capability resolves its model, and a missing or broken
+model is reported at the model, with the capability as the referrer. What a
+hop builds stays in the source's cache, so the command that follows uses that
+same instance. A launch is the exception: starting its session proxy discards
+the set the check built, and the launch builds what it uses again with
+providers pointed at the proxy. Asking who points at an instance stays a
 configuration read, because a removal needs the answer before anything is
 built.
 
-The problem vocabulary the prompt reads gains the two cases resolution adds,
-settings that cannot be read and a model that does not meet its requirement,
-and loses `MissingDependency`. Construction takes over that verdict by running
+The problem vocabulary the prompt reads gains the cases resolution adds,
+settings that cannot be read, a model that does not meet its requirement, and
+a capability that builds and names something the walk did not find, and loses
+`MissingDependency`. A model that does not meet the requirement comes back
+from the model source as a typed error, so the requirement is compared in one
+place and reported with the model and the unmet part named. Construction takes over that verdict by running
 the validation its settings type declares, which the six capability config
 structs already derive with `serde_valid` and nothing calls today, so
 `#[validate(min_length = 1)]` on a model id starts deciding whether that id is
 usable. `Validatable::refs` reports only the ids it finds, leaving whether a
 required setting is present to the type that declares it. The two land in one
-commit because they are one verdict changing hands.
+commit because they are one verdict changing hands. Each `min_length` rule
+carries a message, so an empty model id is reported as `model_id: no model is
+selected`.
 
 The module documentation stops saying the walk constructs nothing, and says
 which two questions it reads and which two it builds to answer.
 
-The prompt gains a second repair for settings it cannot read: replace the
-fields that cannot be read with the type's defaults, and keep everything else
-the instance was configured with. The settings blob is valid JSON and it is
-reading it as the type's config that failed, usually over one field, so each
-field that differs from its default is tried on its own before any are
-replaced together. The offer names the fields and the values they would take,
-so nobody accepts a repair without knowing what it moves, and it appears only
-when such a replacement builds: it does for a provider with a mistyped
-timeout, and does not for an `agent-model` capability whose required model id
-is empty, whose default is that same empty id.
+With `MissingDependency` gone, a dependency that a capability type declares
+required is enforced only by its config type's validation. A test goes over
+every registered capability type and checks that each required dependency left
+empty fails construction over that key, so a type that declares one without the
+validation fails the test.
 
-```
-⚠ Configuration issue: provider 'ollama' has settings that cannot be read:
-  invalid type: string "ten", expected u64
-What would you like to do?
-  Reconfigure provider 'ollama' now
-  Reset provider 'ollama' timeout_secs setting to its default value of 10
-  Remove provider 'ollama'
-> Cancel
-```
+The remediation prompt reports the new problems with the repairs it
+already offers, reconfigure and remove. Sub-Task 11 adds a repair specific to
+settings that cannot be read.
 
 A capability whose model does not meet its requirement shows up in a list the
 way a dangling reference does:
@@ -622,19 +630,24 @@ settings, passing when they list the required function and failing when they
 do not; the same mismatch reached through a launcher reported with the
 launcher as referrer; `capability list` and `launcher list` annotating a
 mismatch without prompting; a capability whose required model id is empty
-reported by construction, with the reset repair absent from its prompt and
-present for a provider whose settings have a field of the wrong type; the
-offer naming that field and the value it takes; and accepting it replacing
-that field while leaving a deliberately configured endpoint alone.
+reported by construction; a provider whose settings have a field of the wrong
+type reported at the provider; every required dependency of every
+capability type rejected by construction when it is empty; every capability
+type that names a model reporting a model that does not meet its requirement
+as an unmet requirement, which holds while each type passes the model lookup's
+error on without rewrapping it as text; and the capability the check built
+being the instance a command asking next gets from the cache.
 
 **Relevant Context**
 - `src/config/validation.rs` (the walk, `Problem`, `Validatable::refs`)
-- `src/commands/shared/remediation.rs` (`Fix::for_error`, `Choice`, `choose`)
+- `src/capabilities/mod.rs` (`CapabilitySource::build`), `src/models/mod.rs`
+  (the requirement check in `ModelLookup::resolve`)
+- `src/commands/shared/remediation.rs` (`dangling_notes`, `remediate`)
 - the `serde_valid::Validate` derives on the capability config structs
 - `src/commands/capability.rs`, `src/commands/launcher.rs` (the list commands)
 - `src/models/custom.rs` (the placeholder registry entry)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -668,7 +681,7 @@ running.
 - `src/launchers/base.rs` (`bind_capability`), `src/capabilities/base.rs`
   (`on_setup` and the other hooks)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
 
 ---
 
@@ -693,4 +706,50 @@ what says the field was only ever read for its own kind.
   `src/launchers/mod.rs` (the four fields)
 - `src/sources.rs` (`Sources::build`, which hands each source its map)
 
-**Status** — `[ ]` not started
+**Status** — `[x]` done
+
+---
+
+### Sub-Task 11 — Settings that are not valid can be reset to defaults
+
+**Intent**
+Offer a repair for settings that are not valid that writes the type's default
+into the fields that are not valid and keeps what the instance was configured
+with. Reconfiguring runs setup, which offers the instance's current values,
+and for a field whose value is not valid it offers a zero value: a provider
+whose `timeout_secs` reads `"ten"` is offered `0`, where the type's default is
+`10`.
+
+**Expected Outcomes**
+
+The prompt gains a second repair for settings that are not valid: replace the
+fields that are not valid with the type's defaults, and keep everything else
+the instance was configured with. The settings blob is valid JSON and it is
+reading it as the type's config that failed, usually over one field, so each
+field that differs from its default is tried on its own before any are
+replaced together. The offer names the fields and the values they would take,
+so nobody accepts a repair without knowing what it moves, and it appears only
+when such a replacement builds: it does for a provider with a mistyped
+timeout, and does not for an `agent-model` capability whose required model id
+is empty, whose default is that same empty id.
+
+```
+⚠ Configuration issue: provider 'ollama' has settings that are not valid:
+  invalid type: string "ten", expected u64
+What would you like to do?
+  Reconfigure provider 'ollama' now
+  Reset provider 'ollama' timeout_secs setting to its default value of 10
+  Remove provider 'ollama'
+> Cancel
+```
+
+Tests cover: the reset repair present for a provider whose settings have a
+field of the wrong type, and absent for a capability whose required model id
+is empty; the offer naming that field and the value it takes; and accepting it
+replacing that field while leaving a deliberately configured endpoint alone.
+
+**Relevant Context**
+- `src/commands/shared/remediation.rs` (`Fix::for_error`, `Choice`, `choose`)
+- the registries' `default_config` and `construct`
+
+**Status** — `[x]` done

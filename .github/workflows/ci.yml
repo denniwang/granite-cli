@@ -6,40 +6,17 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  rust:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.96.1
-        with:
-          toolchain: 1.88.0
-          components: rustfmt, clippy
-
-      - name: Cache cargo build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-
-      - name: Check capability table is up to date
-        run: bash scripts/update-capability-table.sh --check
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Build
-        run: cargo build --locked --all-targets --all-features
-
-      - name: Test
-        run: cargo test --locked --all-targets --all-features
+  check:
+    uses: ./.github/workflows/check.yml
 
   cross-build:
     name: Build + test (${{ matrix.target }})
+    needs: [check]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -58,7 +35,7 @@ jobs:
           #  os: macos-13
 
     steps:
-      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.96.1
         with:
@@ -86,6 +63,7 @@ jobs:
 
   coverage:
     name: Coverage
+    needs: [check]
     runs-on: ubuntu-latest
     env:
       # Minimum line coverage, in percent: for the whole crate, and for the
@@ -96,7 +74,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # diff-cover compares against the base branch
           fetch-depth: 0

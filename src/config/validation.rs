@@ -1,10 +1,22 @@
-//! Answers whether a configured instance's references resolve, reading the
-//! configuration and static registry metadata and constructing nothing.
+//! Answers whether a configured instance can be used, by resolving it: the
+//! names it holds, the settings it carries, and what its type requires of
+//! what it names.
 //!
-//! Two kinds of reference are checked. An id names another configured
-//! instance, and a `*_type` name names an entry in that kind's registry. A
-//! name that resolves to nothing is the same kind of inconsistency either
-//! way.
+//! Three things can be wrong. An id names another configured instance that
+//! is not there, a `*_type` name is not a key in that kind's registry, and an
+//! instance's own settings cannot be read as its type's config. A capability
+//! has a fourth: the model it names is configured and does not meet what the
+//! capability type requires of it.
+//!
+//! The first two are read from the configuration and the registries. The
+//! other two are answered by building the instance through the source that
+//! owns its kind, which is the same call a command makes to use it, so this
+//! walk and the command cannot disagree. What is built here stays in the
+//! source's cache, and the command gets that same instance. A launch is the
+//! exception: starting its session proxy discards the set the check built,
+//! and the launch builds what it uses again with providers pointed at the
+//! proxy. Asking who points at an instance stays a plain read, since a
+//! removal needs the answer before anything is built.
 //!
 //! One walk covers every kind. Each of the four config types implements
 //! [`Validatable`] to say what its type name is and which ids it points at,
@@ -17,6 +29,7 @@ use crate::capabilities::Dependency;
 use crate::config::{
     CapabilityConfig, Config, ConfigId, LauncherConfig, ModelConfig, ProviderConfig,
 };
+use crate::sources::Sources;
 
 /*-- public --------------------------------------------------------------------*/
 
@@ -37,9 +50,42 @@ pub(crate) enum Problem {
     NotConfigured,
     /// The instance's `*_type` is not a key in its kind's registry.
     UnknownType { type_name: String },
-    /// A capability whose config carries no id under a required dependency's
-    /// `config_key`.
-    MissingDependency { config_key: String },
+    /// The instance's own settings cannot be read as its type's config.
+    UnreadableSettings { detail: String },
+    /// A capability's model is configured, and does not meet what the
+    /// capability type requires of it.
+    UnmetRequirement { model_id: String, unmet: String },
+    /// The instance builds, and a name it holds does not resolve although
+    /// the walk found every name it reads valid. This is the case where a
+    /// type reads an id from a different setting than its dependency
+    /// metadata declares.
+    Unresolved { detail: String },
+}
+
+impl From<crate::registry::ConstructError> for Problem {
+    fn from(error: crate::registry::ConstructError) -> Self {
+        match error {
+            crate::registry::ConstructError::UnknownType { type_name } => {
+                Self::UnknownType { type_name }
+            }
+            crate::registry::ConstructError::Settings { detail } => {
+                Self::UnreadableSettings { detail }
+            }
+        }
+    }
+}
+
+impl From<crate::sources::SourceError> for Problem {
+    fn from(error: crate::sources::SourceError) -> Self {
+        match error {
+            crate::sources::SourceError::NotConfigured => Self::NotConfigured,
+            crate::sources::SourceError::Construct(error) => error.into(),
+            crate::sources::SourceError::UnmetRequirement { model_id, unmet } => {
+                Self::UnmetRequirement { model_id, unmet }
+            }
+            crate::sources::SourceError::Unresolved(detail) => Self::Unresolved { detail },
+        }
+    }
 }
 
 /// A reference that does not resolve.
@@ -75,8 +121,9 @@ pub(crate) fn validate_ref(
     kind: RefKind,
     id: &str,
     config: &Config,
+    sources: &Sources,
 ) -> Result<(), ValidationError> {
-    validate(kind, id, config, None)
+    validate(kind, id, config, sources, None)
 }
 
 /// Validates every configured instance of one kind, returning those that
@@ -88,23 +135,25 @@ pub(crate) fn validate_ref(
 /// ```ignore
 /// // The status column of `model list`. One scan covers the whole table, and
 /// // reports only models even when what is actually missing is a provider.
-/// let broken = find_dangling(RefKind::Model, &config);
+/// let broken = find_dangling(RefKind::Model, &config, &Sources::build(&config, None));
 /// for row in &mut rows {
 ///     if let Some(d) = broken.iter().find(|d| d.instance_id == row.id) {
 ///         row.notes = format!("{} {}", ui.warn_mark(), d.reason);
 ///     }
 /// }
 /// ```
-pub(crate) fn find_dangling(kind: RefKind, config: &Config) -> Vec<DanglingRef> {
+pub(crate) fn find_dangling(kind: RefKind, config: &Config, sources: &Sources) -> Vec<DanglingRef> {
     config_entries(config, kind)
         .into_iter()
         .filter_map(|entry| {
             let id = entry.config_id();
-            validate_ref(kind, id, config).err().map(|e| DanglingRef {
-                kind,
-                instance_id: id.to_string(),
-                reason: e.to_string(),
-            })
+            validate_ref(kind, id, config, sources)
+                .err()
+                .map(|e| DanglingRef {
+                    kind,
+                    instance_id: id.to_string(),
+                    reason: e.to_string(),
+                })
         })
         .collect()
 }
@@ -136,12 +185,10 @@ pub(crate) fn dependents(kind: RefKind, id: &str, config: &Config) -> Vec<(RefKi
             .map(move |entry| (referrer_kind, entry))
     })
     .filter(|(_, entry)| {
-        // An instance that cannot name its references, such as a capability
-        // missing a required dependency, points at nothing.
-        entry.refs().is_ok_and(|refs| {
-            refs.iter()
-                .any(|(target_kind, target_id)| *target_kind == kind && *target_id == id)
-        })
+        entry
+            .refs()
+            .iter()
+            .any(|(target_kind, target_id)| *target_kind == kind && *target_id == id)
     })
     .map(|(referrer_kind, entry)| (referrer_kind, entry.config_id().to_string()))
     .collect();
@@ -183,9 +230,16 @@ impl std::fmt::Display for ValidationError {
             Problem::UnknownType { type_name } => {
                 write!(f, "has an unknown {kind} type '{type_name}'")
             }
-            Problem::MissingDependency { config_key } => {
-                write!(f, "is missing required dependency '{config_key}'")
+            Problem::UnreadableSettings { detail } => {
+                write!(f, "has settings that are not valid: {detail}")
             }
+            Problem::UnmetRequirement { model_id, unmet } => {
+                write!(
+                    f,
+                    "names model '{model_id}', which does not meet its requirement: {unmet}"
+                )
+            }
+            Problem::Unresolved { detail } => write!(f, "does not resolve: {detail}"),
         }
     }
 }
@@ -208,10 +262,11 @@ pub(crate) trait Validatable: ConfigId {
 
     /// The instances this one points at, for the walk to follow.
     ///
-    /// The error is for an instance that cannot name its references at all,
-    /// such as a model with no provider. That is a problem with this
-    /// instance rather than with anything it points at.
-    fn refs(&self) -> Result<Vec<(RefKind, &str)>, Problem>;
+    /// An id it does not hold is not reported here: whether a setting has to
+    /// be there is what building the instance answers, so an entry with
+    /// nothing under a required key names nothing and construction reports
+    /// it.
+    fn refs(&self) -> Vec<(RefKind, &str)>;
 }
 
 /// Reaching the four maps by [`RefKind`] rather than by name. These live with
@@ -252,8 +307,8 @@ fn erase<T: Validatable>(map: &HashMap<String, T>) -> Vec<&dyn Validatable> {
 }
 
 /// The recursive body of [`validate_ref`], and the whole of what validating
-/// one instance means: it is configured, its type name resolves, and every id
-/// it points at validates in turn.
+/// one instance means: it is configured, its type name resolves, it builds
+/// from its own settings, and every id it points at validates in turn.
 ///
 /// `referrer` is the instance whose reference brought the walk here, and
 /// rides along so that a failure names the instance a caller would act on
@@ -262,6 +317,7 @@ fn validate(
     kind: RefKind,
     id: &str,
     config: &Config,
+    sources: &Sources,
     referrer: Option<(RefKind, &str)>,
 ) -> Result<(), ValidationError> {
     let entry = config_entry(config, kind, id)
@@ -278,14 +334,29 @@ fn validate(
         ));
     }
 
-    let refs = entry
-        .refs()
-        .map_err(|problem| err(kind, id, problem, referrer))?;
-
-    for (target_kind, target_id) in refs {
-        validate(target_kind, target_id, config, Some((kind, id)))?;
+    // What an instance points at is checked before the instance is built.
+    // Building a capability resolves its model, and a model that is missing
+    // or broken is reported at the model, with this instance as the
+    // referrer the remediation prompt acts on.
+    for (target_kind, target_id) in entry.refs() {
+        validate(target_kind, target_id, config, sources, Some((kind, id)))?;
     }
-    Ok(())
+
+    resolves(kind, id, sources).map_err(|problem| err(kind, id, problem, referrer))
+}
+
+/// What the source that owns `kind` says about the entry under `id`: whether
+/// its settings are valid, and for a capability whether the model it names
+/// meets what its type requires. What is built here stays in that source's
+/// cache, so the command that goes on to use it does not build it again.
+fn resolves(kind: RefKind, id: &str, sources: &Sources) -> Result<(), Problem> {
+    match kind {
+        RefKind::Launcher => sources.launchers().build(id).map(|_| ()),
+        RefKind::Capability => sources.capabilities().build(id).map(|_| ()),
+        RefKind::Model => sources.models().build(id).map(|_| ()),
+        RefKind::Provider => sources.providers().build(id).map(|_| ()),
+    }
+    .map_err(Problem::from)
 }
 
 impl Validatable for LauncherConfig {
@@ -299,12 +370,11 @@ impl Validatable for LauncherConfig {
             .is_some()
     }
 
-    fn refs(&self) -> Result<Vec<(RefKind, &str)>, Problem> {
-        Ok(self
-            .enabled_capabilities
+    fn refs(&self) -> Vec<(RefKind, &str)> {
+        self.enabled_capabilities
             .iter()
             .map(|id| (RefKind::Capability, id.as_str()))
-            .collect())
+            .collect()
     }
 }
 
@@ -320,16 +390,14 @@ impl Validatable for CapabilityConfig {
     }
 
     /// A capability stores its dependency ids inside its own config JSON, and
-    /// only its type's static metadata says which keys hold them. The walk
-    /// has already established that the type resolves, so the error here is
-    /// for a direct caller.
-    fn refs(&self) -> Result<Vec<(RefKind, &str)>, Problem> {
-        let metadata = crate::capabilities::CAPABILITY_REGISTRY
+    /// only its type's static metadata says which keys hold them. A type the
+    /// registry does not have names nothing, which the walk reports as an
+    /// unknown type before it asks.
+    fn refs(&self) -> Vec<(RefKind, &str)> {
+        crate::capabilities::CAPABILITY_REGISTRY
             .get(&self.capability_type)
-            .ok_or_else(|| Problem::UnknownType {
-                type_name: self.capability_type.clone(),
-            })?;
-        dependency_refs(&self.config, &metadata.dependencies)
+            .map(|metadata| dependency_refs(&self.config, &metadata.dependencies))
+            .unwrap_or_default()
     }
 }
 
@@ -346,8 +414,8 @@ impl Validatable for ModelConfig {
 
     /// `provider_id` is required, so a model always names a provider. Whether
     /// that name resolves is the walk's business, like any other reference.
-    fn refs(&self) -> Result<Vec<(RefKind, &str)>, Problem> {
-        Ok(vec![(RefKind::Provider, &self.provider_id)])
+    fn refs(&self) -> Vec<(RefKind, &str)> {
+        vec![(RefKind::Provider, &self.provider_id)]
     }
 }
 
@@ -363,8 +431,8 @@ impl Validatable for ProviderConfig {
     }
 
     /// A provider references no other configured instance.
-    fn refs(&self) -> Result<Vec<(RefKind, &str)>, Problem> {
-        Ok(Vec::new())
+    fn refs(&self) -> Vec<(RefKind, &str)> {
+        Vec::new()
     }
 }
 
@@ -373,29 +441,19 @@ impl Validatable for ProviderConfig {
 ///
 /// A dependency contributes a reference whenever it holds an id, whether or
 /// not it is declared required, so a dangling optional dependency is walked
-/// like any other. `required` governs only whether an absent value is itself
-/// a problem: absent and required is a missing dependency, absent and
-/// optional is a valid state with nothing to check. An id present but empty
-/// counts as absent, which is the state `commands::setup` leaves behind when
-/// no model was selected.
+/// like any other. A key holding nothing, or holding an empty string, names
+/// nothing: whether the setting had to be there is what building the
+/// capability answers, since its config type is what declares that.
 fn dependency_refs<'a>(
     capability_config: &'a serde_json::Value,
     dependencies: &[Dependency],
-) -> Result<Vec<(RefKind, &'a str)>, Problem> {
+) -> Vec<(RefKind, &'a str)> {
     let mut refs = Vec::new();
 
     for dependency in dependencies {
-        let (kind, config_key, required) = match dependency {
-            Dependency::Model {
-                config_key,
-                required,
-                ..
-            } => (RefKind::Model, config_key, *required),
-            Dependency::Provider {
-                config_key,
-                required,
-                ..
-            } => (RefKind::Provider, config_key, *required),
+        let (kind, config_key) = match dependency {
+            Dependency::Model { config_key, .. } => (RefKind::Model, config_key),
+            Dependency::Provider { config_key, .. } => (RefKind::Provider, config_key),
             // An external tool is a shell command, not a configured instance.
             Dependency::ExternalTool { .. } => continue,
         };
@@ -406,18 +464,13 @@ fn dependency_refs<'a>(
             .unwrap_or_default();
 
         if id.is_empty() {
-            if required {
-                return Err(Problem::MissingDependency {
-                    config_key: config_key.clone(),
-                });
-            }
             continue;
         }
 
         refs.push((kind, id));
     }
 
-    Ok(refs)
+    refs
 }
 
 fn err(
@@ -454,8 +507,21 @@ mod tests {
             model_type: model_type.to_string(),
             provider_id: provider_id.unwrap_or("ollama").to_string(),
             variant: None,
-            config: serde_json::json!({}),
+            // The walk builds the model now, and compares it with what the
+            // capability naming it requires: `family` is what a custom
+            // model's settings have to state, and the functions are what
+            // `agent-model` asks of the model it names.
+            config: serde_json::json!({
+                "family": "Test",
+                "supported_functions": ["Chat", "ToolCalling"],
+            }),
         }
+    }
+
+    /// `validate_ref` over a configuration and the sources built from it,
+    /// which is how every caller reaches it.
+    fn check(kind: RefKind, id: &str, config: &Config) -> Result<(), ValidationError> {
+        validate_ref(kind, id, config, &Sources::build(config, None))
     }
 
     fn capability(id: &str, capability_type: &str, model_id: &str) -> CapabilityConfig {
@@ -505,7 +571,7 @@ mod tests {
             (RefKind::Launcher, "claude"),
         ] {
             assert!(
-                validate_ref(kind, id, &config).is_ok(),
+                check(kind, id, &config).is_ok(),
                 "{kind} '{id}' should validate"
             );
         }
@@ -520,7 +586,7 @@ mod tests {
             RefKind::Capability,
             RefKind::Launcher,
         ] {
-            let err = validate_ref(kind, "nope", &config).expect_err("should fail");
+            let err = check(kind, "nope", &config).expect_err("should fail");
             assert_eq!(err.problem, Problem::NotConfigured);
             assert_eq!(err.target, (kind, "nope".to_string()));
             assert_eq!(err.referrer, None);
@@ -542,12 +608,12 @@ mod tests {
             launcher("launcher-broken", "claude", &["gone"]),
         );
 
-        assert!(validate_ref(RefKind::Model, "m1", &config).is_ok());
-        assert!(validate_ref(RefKind::Model, "m-broken", &config).is_err());
-        assert!(validate_ref(RefKind::Capability, "chat", &config).is_ok());
-        assert!(validate_ref(RefKind::Capability, "cap-broken", &config).is_err());
-        assert!(validate_ref(RefKind::Launcher, "claude", &config).is_ok());
-        assert!(validate_ref(RefKind::Launcher, "launcher-broken", &config).is_err());
+        assert!(check(RefKind::Model, "m1", &config).is_ok());
+        assert!(check(RefKind::Model, "m-broken", &config).is_err());
+        assert!(check(RefKind::Capability, "chat", &config).is_ok());
+        assert!(check(RefKind::Capability, "cap-broken", &config).is_err());
+        assert!(check(RefKind::Launcher, "claude", &config).is_ok());
+        assert!(check(RefKind::Launcher, "launcher-broken", &config).is_err());
     }
 
     #[test]
@@ -555,7 +621,7 @@ mod tests {
         let mut config = healthy();
         config.providers.remove("p1");
 
-        let err = validate_ref(RefKind::Launcher, "claude", &config).expect_err("should fail");
+        let err = check(RefKind::Launcher, "claude", &config).expect_err("should fail");
 
         // The walk reached the provider rather than stopping at the launcher
         // or the capability, both of which are themselves configured.
@@ -571,7 +637,7 @@ mod tests {
         let mut config = healthy();
         config.models.remove("m1");
 
-        let err = validate_ref(RefKind::Launcher, "claude", &config).expect_err("should fail");
+        let err = check(RefKind::Launcher, "claude", &config).expect_err("should fail");
 
         assert_eq!(err.target, (RefKind::Model, "m1".to_string()));
         assert_eq!(
@@ -608,7 +674,7 @@ mod tests {
             (RefKind::Capability, "cap-bad", "not-a-capability"),
             (RefKind::Launcher, "launcher-bad", "not-a-launcher"),
         ] {
-            let err = validate_ref(kind, id, &config).expect_err("should fail");
+            let err = check(kind, id, &config).expect_err("should fail");
             assert_eq!(
                 err.problem,
                 Problem::UnknownType {
@@ -635,7 +701,7 @@ mod tests {
         // Absent: nothing to check.
         assert_eq!(
             dependency_refs(&serde_json::json!({}), &optional("model_id")),
-            Ok(vec![])
+            vec![]
         );
         // Present but empty counts as absent.
         assert_eq!(
@@ -643,7 +709,7 @@ mod tests {
                 &serde_json::json!({ "model_id": "" }),
                 &optional("model_id")
             ),
-            Ok(vec![])
+            vec![]
         );
         // Present: walked like any other reference, whether or not it
         // resolves. `gone` is not configured, and the walk is what reports
@@ -653,19 +719,19 @@ mod tests {
                 &serde_json::json!({ "model_id": "m1" }),
                 &optional("model_id")
             ),
-            Ok(vec![(RefKind::Model, "m1")])
+            vec![(RefKind::Model, "m1")]
         );
         assert_eq!(
             dependency_refs(
                 &serde_json::json!({ "model_id": "gone" }),
                 &optional("model_id")
             ),
-            Ok(vec![(RefKind::Model, "gone")])
+            vec![(RefKind::Model, "gone")]
         );
     }
 
     #[test]
-    fn an_absent_required_dependency_is_a_missing_dependency() {
+    fn an_absent_required_dependency_names_nothing_and_construction_reports_it() {
         let required = vec![Dependency::Model {
             config_key: "model_id".to_string(),
             requirement: ModelRequirement::default(),
@@ -673,24 +739,68 @@ mod tests {
             required: true,
         }];
 
-        assert_eq!(
-            dependency_refs(&serde_json::json!({}), &required),
-            Err(Problem::MissingDependency {
-                config_key: "model_id".to_string()
-            })
-        );
+        // Whether a setting has to be there is what the capability's own
+        // config type declares, so an entry with nothing under the key names
+        // nothing here and is reported where it is built.
+        assert_eq!(dependency_refs(&serde_json::json!({}), &required), vec![]);
 
-        let rendered = err(
-            RefKind::Capability,
-            "cap",
-            Problem::MissingDependency {
-                config_key: "model_id".to_string(),
-            },
-            None,
+        let mut config = healthy();
+        config
+            .capabilities
+            .insert("chat".into(), capability("chat", "agent-model", ""));
+
+        let err = check(RefKind::Capability, "chat", &config).expect_err("should fail");
+        assert!(
+            matches!(err.problem, Problem::UnreadableSettings { .. }),
+            "expected unreadable settings, got {:?}",
+            err.problem
         );
-        assert_eq!(
-            rendered.to_string(),
-            "capability 'cap' is missing required dependency 'model_id'"
+    }
+
+    #[test]
+    fn every_required_dependency_is_enforced_by_its_config_type() {
+        // The walk reports an empty required id only through construction,
+        // so a capability type that declares a dependency `required` has to
+        // reject an empty value for it in its config type's validation. This
+        // checks every registered type, so a new one that declares the
+        // dependency without the validation fails here.
+        let mut checked = 0;
+        for (type_name, metadata) in crate::capabilities::CAPABILITY_REGISTRY.entries() {
+            for dependency in &metadata.dependencies {
+                let config_key = match dependency {
+                    Dependency::Model {
+                        config_key,
+                        required: true,
+                        ..
+                    }
+                    | Dependency::Provider {
+                        config_key,
+                        required: true,
+                        ..
+                    } => config_key,
+                    _ => continue,
+                };
+                let mut settings = crate::capabilities::CAPABILITY_REGISTRY
+                    .default_config(type_name)
+                    .unwrap_or_else(|| serde_json::json!({}));
+                settings[config_key.as_str()] = serde_json::json!("");
+
+                let err = crate::capabilities::CAPABILITY_REGISTRY
+                    .construct(type_name, type_name, &settings)
+                    .err()
+                    .unwrap_or_else(|| {
+                        panic!("'{type_name}' builds with an empty required '{config_key}'")
+                    });
+                assert!(
+                    err.to_string().contains(&format!("{config_key}:")),
+                    "'{type_name}' failed for another reason: {err}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "no capability type declares a required dependency"
         );
     }
 
@@ -703,14 +813,13 @@ mod tests {
             .capabilities
             .insert("chat".into(), capability("chat", "agent-model", ""));
 
-        let err = validate_ref(RefKind::Launcher, "claude", &config).expect_err("should fail");
+        let err = check(RefKind::Launcher, "claude", &config).expect_err("should fail");
 
         assert_eq!(err.target, (RefKind::Capability, "chat".to_string()));
-        assert_eq!(
-            err.problem,
-            Problem::MissingDependency {
-                config_key: "model_id".to_string()
-            }
+        assert!(
+            matches!(err.problem, Problem::UnreadableSettings { .. }),
+            "expected unreadable settings, got {:?}",
+            err.problem
         );
         assert_eq!(
             err.referrer,
@@ -719,8 +828,129 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "launcher 'claude' depends on capability 'chat', \
-             which is missing required dependency 'model_id'"
+             which has settings that are not valid: model_id: no model is selected"
         );
+    }
+
+    #[test]
+    fn a_model_that_does_not_meet_the_requirement_is_reported_with_what_is_unmet() {
+        let mut config = healthy();
+        // `m1` states Chat and ToolCalling, which is what `agent-model`
+        // asks of the model it names. `vision-mcp` asks for a vision model
+        // that understands images, which `m1` is not.
+        config
+            .capabilities
+            .insert("vision".into(), capability("vision", "vision-mcp", "m1"));
+
+        assert!(
+            check(RefKind::Capability, "chat", &config).is_ok(),
+            "the same model satisfies the capability whose requirement it meets"
+        );
+
+        let err = check(RefKind::Capability, "vision", &config).expect_err("should fail");
+        assert_eq!(err.target, (RefKind::Capability, "vision".to_string()));
+        let Problem::UnmetRequirement { model_id, unmet } = &err.problem else {
+            panic!("expected an unmet requirement, got {:?}", err.problem);
+        };
+        assert_eq!(model_id, "m1");
+        assert!(
+            unmet.contains("Image Understanding"),
+            "the unmet part is named: {unmet}"
+        );
+    }
+
+    #[test]
+    fn a_custom_model_is_judged_by_its_own_settings() {
+        let mut config = healthy();
+        config.capabilities.insert(
+            "vision".into(),
+            capability("vision", "vision-mcp", "m-vision"),
+        );
+
+        // A `custom` model's registry entry is a placeholder, so what it can
+        // do is what its own settings say.
+        config.models.insert(
+            "m-vision".into(),
+            ModelConfig {
+                model_id: "m-vision".to_string(),
+                model_type: "custom".to_string(),
+                provider_id: "p1".to_string(),
+                variant: None,
+                config: serde_json::json!({
+                    "family": "Test",
+                    "model_type": "Vision",
+                    "supported_functions": ["Chat", "ImageUnderstanding"],
+                }),
+            },
+        );
+        assert!(check(RefKind::Capability, "vision", &config).is_ok());
+
+        config
+            .models
+            .get_mut("m-vision")
+            .unwrap()
+            .config
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "supported_functions".to_string(),
+                serde_json::json!(["Chat"]),
+            );
+        let err = check(RefKind::Capability, "vision", &config).expect_err("should fail");
+        assert!(matches!(err.problem, Problem::UnmetRequirement { .. }));
+    }
+
+    #[test]
+    fn a_mismatch_reached_through_a_launcher_names_the_launcher_as_referrer() {
+        let mut config = healthy();
+        config
+            .capabilities
+            .insert("vision".into(), capability("vision", "vision-mcp", "m1"));
+        config.launchers.insert(
+            "claude".into(),
+            launcher("claude", "claude", &["chat", "vision"]),
+        );
+
+        let err = check(RefKind::Launcher, "claude", &config).expect_err("should fail");
+        assert_eq!(err.target, (RefKind::Capability, "vision".to_string()));
+        assert_eq!(
+            err.referrer,
+            Some((RefKind::Launcher, "claude".to_string()))
+        );
+        assert!(
+            err.to_string().contains("does not meet its requirement"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_model_that_is_not_configured_is_still_reported_as_not_configured() {
+        let mut config = healthy();
+        config.models.remove("m1");
+
+        let err = check(RefKind::Capability, "chat", &config).expect_err("should fail");
+        assert_eq!(err.target, (RefKind::Model, "m1".to_string()));
+        assert_eq!(err.problem, Problem::NotConfigured);
+    }
+
+    #[test]
+    fn settings_that_cannot_be_read_are_reported_at_the_instance_that_holds_them() {
+        let mut config = healthy();
+        config.providers.insert(
+            "p1".into(),
+            ProviderConfig {
+                provider_id: "p1".to_string(),
+                provider_type: "ollama".to_string(),
+                config: serde_json::json!({ "timeout_secs": "ten" }),
+            },
+        );
+
+        let err = check(RefKind::Launcher, "claude", &config).expect_err("should fail");
+        assert_eq!(err.target, (RefKind::Provider, "p1".to_string()));
+        let Problem::UnreadableSettings { detail } = &err.problem else {
+            panic!("expected unreadable settings, got {:?}", err.problem);
+        };
+        assert!(detail.contains("invalid type"), "got: {detail}");
     }
 
     #[test]
@@ -731,7 +961,7 @@ mod tests {
             },
             required: true,
         }];
-        assert_eq!(dependency_refs(&serde_json::json!({}), &deps), Ok(vec![]));
+        assert_eq!(dependency_refs(&serde_json::json!({}), &deps), vec![]);
     }
 
     #[test]
@@ -748,15 +978,21 @@ mod tests {
             .models
             .insert("m-bad-type".into(), model("m-bad-type", "nope", Some("p1")));
 
-        let mut broken: Vec<String> = find_dangling(RefKind::Model, &config)
-            .into_iter()
-            .map(|d| d.instance_id)
-            .collect();
+        let mut broken: Vec<String> =
+            find_dangling(RefKind::Model, &config, &Sources::build(&config, None))
+                .into_iter()
+                .map(|d| d.instance_id)
+                .collect();
         broken.sort();
         assert_eq!(broken, ["m-bad-type", "m-gone", "m-no-provider"]);
 
-        assert!(find_dangling(RefKind::Provider, &config).is_empty());
-        assert_eq!(find_dangling(RefKind::Capability, &config).len(), 0);
+        assert!(
+            find_dangling(RefKind::Provider, &config, &Sources::build(&config, None)).is_empty()
+        );
+        assert_eq!(
+            find_dangling(RefKind::Capability, &config, &Sources::build(&config, None)).len(),
+            0
+        );
     }
 
     #[test]
@@ -768,7 +1004,10 @@ mod tests {
             RefKind::Capability,
             RefKind::Launcher,
         ] {
-            assert!(find_dangling(kind, &config).is_empty(), "{kind}");
+            assert!(
+                find_dangling(kind, &config, &Sources::build(&config, None)).is_empty(),
+                "{kind}"
+            );
         }
     }
 
@@ -785,12 +1024,16 @@ mod tests {
             (RefKind::Capability, vec!["chat"]),
             (RefKind::Launcher, vec!["claude"]),
         ] {
-            let found: Vec<String> = find_dangling(kind, &config)
+            let found: Vec<String> = find_dangling(kind, &config, &Sources::build(&config, None))
                 .into_iter()
                 .map(|d| d.instance_id)
                 .collect();
             assert_eq!(found, expected, "{kind}");
-            assert!(find_dangling(kind, &config).iter().all(|d| d.kind == kind));
+            assert!(
+                find_dangling(kind, &config, &Sources::build(&config, None))
+                    .iter()
+                    .all(|d| d.kind == kind)
+            );
         }
     }
 
@@ -837,7 +1080,7 @@ mod tests {
         let mut config = healthy();
         config.providers.remove("p1");
 
-        let dangling = find_dangling(RefKind::Model, &config);
+        let dangling = find_dangling(RefKind::Model, &config, &Sources::build(&config, None));
         assert_eq!(dangling.len(), 1);
         assert_eq!(dangling[0].kind, RefKind::Model);
         assert_eq!(dangling[0].instance_id, "m1");

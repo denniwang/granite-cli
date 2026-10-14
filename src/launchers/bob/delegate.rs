@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 // Third Party
 use rmcp::model::{
-    CallToolRequestMethod, CallToolRequestParams, CallToolResult, ContentBlock, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CacheScope, CallToolRequestMethod, CallToolRequestParams, CallToolResult, ContentBlock,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{MaybeSendFuture, RequestContext};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -209,7 +209,7 @@ impl ServerHandler for DelegateToolRegistry {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let tools = self
             .agents
@@ -222,7 +222,19 @@ impl ServerHandler for DelegateToolRegistry {
                 )
             })
             .collect();
-        Ok(ListToolsResult::with_all_items(tools))
+        // The 2026-07-28 spec requires ttl_ms and cache_scope in tools/list
+        // responses. Set them to sensible defaults when the protocol version
+        // supports them; mirror the rmcp #[tool_handler] macro behavior.
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
+        let result = ListToolsResult::with_all_items(tools);
+        let result = if supports_cache_hints {
+            result.with_ttl_ms(0).with_cache_scope(CacheScope::Public)
+        } else {
+            result
+        };
+        Ok(result)
     }
 
     fn call_tool(
@@ -295,6 +307,15 @@ mod tests {
     use super::*;
     use crate::capabilities::{AgentModelBinding, ApiType};
     use crate::utils::ui::backends::plain::PlainOutput;
+
+    /// Extract the JSON payload from an SSE response body, falling back to the
+    /// raw body when it is plain JSON.
+    fn extract_json_response(body: &str) -> String {
+        body.lines()
+            .find_map(|line| line.trim().strip_prefix("data: "))
+            .map(|data| data.trim().to_string())
+            .unwrap_or_else(|| body.to_string())
+    }
 
     fn agent_model_binding() -> AgentModelBinding {
         AgentModelBinding {
@@ -452,11 +473,83 @@ mod tests {
         assert!(resp.status().is_success(), "status: {}", resp.status());
         let body = resp.text().await.unwrap();
 
+        // Under older protocol versions, ttlMs and cacheScope must be absent.
         assert!(body.contains("\"explore\""), "body: {body}");
         assert!(body.contains("explore the repo"), "body: {body}");
         assert!(body.contains("\"plan\""), "body: {body}");
         assert!(body.contains("plan the work"), "body: {body}");
         assert!(body.contains("\"task\""), "body: {body}");
+        assert!(
+            !body.contains("ttlMs"),
+            "ttlMs must be absent under older protocol versions: {body}"
+        );
+        assert!(
+            !body.contains("cacheScope"),
+            "cacheScope must be absent under older protocol versions: {body}"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn list_tools_reports_ttl_and_cache_scope_for_2026_07_28() {
+        // 2026-07-28 is sessionless: no initialize call needed.
+        let (binding, server) = start_test_server(vec![
+            ("explore".to_string(), sub_agent_binding("explore the repo")),
+            ("plan".to_string(), sub_agent_binding("plan the work")),
+        ])
+        .await;
+        let url = mcp_url(&binding);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Mcp-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "tools/list")
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        }
+                    },
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "status: {}", resp.status());
+        let body = extract_json_response(&resp.text().await.unwrap());
+
+        assert!(body.contains("\"explore\""), "body: {body}");
+        assert!(body.contains("explore the repo"), "body: {body}");
+        assert!(body.contains("\"plan\""), "body: {body}");
+        assert!(body.contains("plan the work"), "body: {body}");
+
+        // The 2026-07-28 spec requires ttlMs and cacheScope.
+        let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let result_obj = result.get("result").and_then(|r| r.as_object());
+        assert_eq!(
+            result_obj
+                .and_then(|r| r.get("ttlMs"))
+                .and_then(|v| v.as_u64()),
+            Some(0),
+            "ttlMs should be 0"
+        );
+        assert_eq!(
+            result_obj
+                .and_then(|r| r.get("cacheScope"))
+                .and_then(|v| v.as_str()),
+            Some("public"),
+            "cacheScope should be public"
+        );
 
         server.shutdown().await;
     }

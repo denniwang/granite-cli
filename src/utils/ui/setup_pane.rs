@@ -15,6 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
+use crate::utils::ui::hints::{Hint, render_hints};
 use crate::utils::ui::tui_ui::{Answer, OutputLevel, OutputLine, Prompt, PullState};
 
 /*-- public --*/
@@ -106,14 +107,18 @@ impl PromptState {
     }
 
     /// Footer hint string for this prompt type.
-    fn hint(&self) -> &'static str {
+    fn hint(&self) -> String {
         match self {
-            PromptState::Select { .. } => "[↑↓/jk] Move  [Enter] Confirm  [Esc] Cancel",
+            PromptState::Select { .. } => render_hints(&[Hint::Move, Hint::Confirm, Hint::Cancel]),
             PromptState::MultiSelect { .. } => {
-                "[↑↓/jk] Move  [Space] Toggle  [Enter] Confirm  [Esc] Cancel"
+                render_hints(&[Hint::Move, Hint::Toggle, Hint::Confirm, Hint::Cancel])
             }
-            PromptState::Confirm { .. } => "[y/n/←→/hl] Select  [Enter] Confirm  [Esc] Cancel",
-            PromptState::Text { .. } => "[typing] Edit  [Enter] Confirm  [Esc] Cancel",
+            PromptState::Confirm { .. } => {
+                render_hints(&[Hint::ConfirmYN, Hint::Confirm, Hint::Cancel])
+            }
+            PromptState::Text { .. } => {
+                render_hints(&[Hint::Typing("Edit"), Hint::Confirm, Hint::Cancel])
+            }
         }
     }
 }
@@ -176,11 +181,11 @@ impl SetupPane {
     }
 
     /// Current footer hint.
-    pub fn hint(&self) -> &'static str {
+    pub fn hint(&self) -> String {
         match &self.active {
             Some(p) => p.hint(),
-            None if self.finished => "[Enter/Esc] Close",
-            None => "[↑↓/jk] Scroll output  [Esc] Cancel",
+            None if self.finished => render_hints(&[Hint::Close]),
+            None => render_hints(&[Hint::ScrollOutput, Hint::Cancel]),
         }
     }
 
@@ -612,6 +617,92 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::sync::mpsc::sync_channel;
+
+    fn make_pane() -> (SetupPane, std::sync::mpsc::SyncSender<Prompt>) {
+        let (prompt_tx, prompt_rx) = sync_channel(4);
+        let (answer_tx, _answer_rx) = sync_channel(4);
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pulls = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let pane = SetupPane::new("T".to_string(), output, pulls, prompt_rx, answer_tx);
+        (pane, prompt_tx)
+    }
+
+    // -- PromptState::hint() --------------------------------------------------
+
+    #[test]
+    fn prompt_state_hint_select() {
+        let (mut pane, tx) = make_pane();
+        tx.send(Prompt::Select {
+            message: "Pick".to_string(),
+            items: vec!["a".to_string()],
+            default: 0,
+        })
+        .unwrap();
+        pane.poll();
+        assert_eq!(pane.hint(), "[↑↓/jk] Move  [Enter] Confirm  [Esc] Cancel");
+    }
+
+    #[test]
+    fn prompt_state_hint_multi_select() {
+        let (mut pane, tx) = make_pane();
+        tx.send(Prompt::MultiSelect {
+            message: "Pick many".to_string(),
+            items: vec!["a".to_string()],
+            defaults: vec![false],
+        })
+        .unwrap();
+        pane.poll();
+        assert_eq!(
+            pane.hint(),
+            "[↑↓/jk] Move  [Space] Toggle  [Enter] Confirm  [Esc] Cancel"
+        );
+    }
+
+    #[test]
+    fn prompt_state_hint_confirm() {
+        let (mut pane, tx) = make_pane();
+        tx.send(Prompt::Confirm {
+            message: "Sure?".to_string(),
+            default: false,
+        })
+        .unwrap();
+        pane.poll();
+        assert_eq!(
+            pane.hint(),
+            "[y/n/←→/hl] Select  [Enter] Confirm  [Esc] Cancel"
+        );
+    }
+
+    #[test]
+    fn prompt_state_hint_text() {
+        let (mut pane, tx) = make_pane();
+        tx.send(Prompt::Text {
+            message: "Name?".to_string(),
+            default: String::new(),
+            allow_empty: false,
+            password: false,
+        })
+        .unwrap();
+        pane.poll();
+        assert_eq!(pane.hint(), "[typing] Edit  [Enter] Confirm  [Esc] Cancel");
+    }
+
+    // -- SetupPane::hint() ----------------------------------------------------
+
+    #[test]
+    fn setup_pane_hint_waiting_for_prompt() {
+        let (pane, _tx) = make_pane();
+        // No prompt sent yet → waiting state
+        assert_eq!(pane.hint(), "[↑↓/jk] Scroll output  [Esc] Cancel");
+    }
+
+    #[test]
+    fn setup_pane_hint_finished() {
+        let (mut pane, tx) = make_pane();
+        drop(tx); // disconnect sender → finished
+        pane.poll();
+        assert_eq!(pane.hint(), "[Enter/Esc] Close");
+    }
 
     #[test]
     fn confirm_requires_enter_after_y_or_n() {

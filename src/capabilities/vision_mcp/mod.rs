@@ -41,7 +41,7 @@ use tokio::sync::Mutex;
 pub struct VisionMCPCapabilityConfig {
     /// Key into the configured models map (the user-chosen instance ID) for
     /// the vision-language model this capability serves.
-    #[validate(min_length = 1)]
+    #[validate(min_length = 1, message = "no model is selected")]
     pub model_id: String,
     /// Request timeout in seconds for calls to the model's provider.
     #[serde(default = "default_timeout_seconds")]
@@ -103,6 +103,9 @@ impl ConfigConstructable for VisionMCPCapability {
     fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
         let config: VisionMCPCapabilityConfig =
             serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;
+        config
+            .validate()
+            .map_err(|e| crate::capabilities::base::invalid_settings(&e))?;
         Ok(Self {
             instance_id: instance_id.to_string(),
             config,

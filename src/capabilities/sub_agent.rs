@@ -27,7 +27,7 @@ macro_rules! declare_sub_agent_basic {
         pub struct $config_struct {
             /// Key into the configured models map (the user-chosen instance ID) for
             /// the model this sub-agent runs on.
-            #[validate(min_length = 1)]
+            #[validate(min_length = 1, message = "no model is selected")]
             pub model_id: String,
         }
 
@@ -77,6 +77,8 @@ macro_rules! declare_sub_agent_basic {
             ) -> Result<Self, $crate::registry::ConstructError> {
                 let config: $config_struct = serde_json::from_value(cfg.clone())
                     .map_err($crate::registry::ConstructError::settings)?;
+                serde_valid::Validate::validate(&config)
+                    .map_err(|e| $crate::capabilities::base::invalid_settings(&e))?;
                 let description = $description_expr;
                 let prompt = $prompt_expr;
                 let tools = $tools_expr;
@@ -210,11 +212,11 @@ macro_rules! declare_sub_agent_full {
             /// Shown to the main agent so it can decide when to delegate to this
             /// sub-agent -- the same role Claude Code's own subagent `description`
             /// field plays.
-            #[validate(min_length = 1)]
+            #[validate(min_length = 1, message = "the description is empty")]
             pub description: String,
             /// Key into the configured models map (the user-chosen instance ID) for
             /// the model this sub-agent runs on.
-            #[validate(min_length = 1)]
+            #[validate(min_length = 1, message = "no model is selected")]
             pub model_id: String,
             $($config_fields)*
         }
@@ -265,6 +267,8 @@ macro_rules! declare_sub_agent_full {
             ) -> Result<Self, $crate::registry::ConstructError> {
                 let config: $config_struct = serde_json::from_value(cfg.clone())
                     .map_err($crate::registry::ConstructError::settings)?;
+                serde_valid::Validate::validate(&config)
+                    .map_err(|e| $crate::capabilities::base::invalid_settings(&e))?;
                 let description = config.description.clone();
                 let prompt = config.prompt.clone();
                 let tools = config.tools.clone();
@@ -392,7 +396,7 @@ declare_sub_agent_full!(
     None;
     {
         /// The sub-agent's system prompt.
-        #[validate(min_length = 1)]
+        #[validate(min_length = 1, message = "the prompt is empty")]
         pub prompt: String,
         /// Tool allow-list. Empty (the default) means "inherit all tools."
         #[serde(default)]

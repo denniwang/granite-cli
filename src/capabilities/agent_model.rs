@@ -19,7 +19,7 @@ use std::collections::HashSet;
 #[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema, Validate)]
 pub struct AgentModelCapabilityConfig {
     /// Key into the configured models map (the user-chosen instance ID).
-    #[validate(min_length = 1)]
+    #[validate(min_length = 1, message = "no model is selected")]
     pub model_id: String,
 }
 
@@ -47,6 +47,9 @@ impl ConfigConstructable for AgentModelCapability {
     fn new(instance_id: &str, cfg: &serde_json::Value) -> Result<Self, ConstructError> {
         let config: AgentModelCapabilityConfig =
             serde_json::from_value(cfg.clone()).map_err(ConstructError::settings)?;
+        config
+            .validate()
+            .map_err(|e| crate::capabilities::base::invalid_settings(&e))?;
         Ok(Self {
             instance_id: instance_id.to_string(),
             config,

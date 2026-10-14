@@ -32,21 +32,6 @@ impl ConstructError {
             detail: detail.to_string(),
         }
     }
-
-    /// This failure as a message naming the instance it is about, for a
-    /// source that knows which kind and id it was asked for. One wording for
-    /// all four kinds, so the same problem reads the same whichever source
-    /// reports it.
-    pub fn about(&self, kind: &str, instance_id: &str) -> anyhow::Error {
-        match self {
-            Self::UnknownType { type_name } => {
-                anyhow::anyhow!("{kind} '{instance_id}' has an unknown {kind} type '{type_name}'")
-            }
-            Self::Settings { detail } => {
-                anyhow::anyhow!("the settings for {kind} '{instance_id}' are not valid: {detail}")
-            }
-        }
-    }
 }
 
 impl std::fmt::Display for ConstructError {

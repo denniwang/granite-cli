@@ -1,12 +1,14 @@
 pub mod capabilities;
 pub mod commands;
 pub mod config;
+mod context;
 pub mod dependency;
 pub mod launchers;
 pub mod models;
 pub mod proxy;
 pub mod registry;
 pub mod session;
+pub mod sources;
 pub mod utils;
 pub mod version {
     include!(concat!(env!("OUT_DIR"), "/version.rs"));
@@ -23,6 +25,7 @@ use commands::{
     CapabilityCommands, HardwareCommands, LauncherCommands, ModelCommands, ProviderCommands,
     SetupCommands,
 };
+pub use context::AppContext;
 use utils::ui::{UI_REGISTRY, Ui, run_interactive_tui};
 
 // Hoist paste macro for use in our own macros
@@ -373,11 +376,6 @@ enum LauncherSubcommands {
     },
 }
 
-pub struct AppContext {
-    pub config: config::Config,
-    pub ui: std::sync::Arc<dyn Ui>,
-}
-
 /// Construct the `Ui` backend for `--output`, exiting on an unrecognized
 /// format. No `Ui` exists yet at this point, so this is the one place in
 /// `main` that still reports via `eprintln!` rather than `ctx.ui`.
@@ -431,7 +429,7 @@ fn construct_context(
         ui.error(&format!("Failed to load config: {e}"));
         std::process::exit(1);
     });
-    AppContext { config, ui }
+    AppContext::new(config, ui)
 }
 
 /*-- private --*/
@@ -756,7 +754,7 @@ async fn run_model_command(ctx: &mut AppContext, subcmd: ModelSubcommands) -> an
         ModelSubcommands::Setup {
             model_type,
             instance_id,
-        } => ModelCommands::setup(ctx, &model_type, instance_id.as_deref()).await,
+        } => ModelCommands::setup(ctx, &model_type, instance_id.as_deref(), false).await,
         ModelSubcommands::Pull { model_id } => ModelCommands::pull(ctx, &model_id).await,
         ModelSubcommands::Remove { model_id } => ModelCommands::remove(ctx, &model_id),
     }
@@ -775,7 +773,7 @@ async fn run_capability_command(
         CapabilitySubcommands::Setup {
             capability_type,
             instance_id,
-        } => CapabilityCommands::setup(ctx, &capability_type, instance_id.as_deref()).await,
+        } => CapabilityCommands::setup(ctx, &capability_type, instance_id.as_deref(), false).await,
         CapabilitySubcommands::Remove { capability_id } => {
             CapabilityCommands::remove(ctx, &capability_id)
         }
@@ -793,7 +791,7 @@ async fn run_provider_command(
         ProviderSubcommands::Setup {
             provider_type,
             instance_id,
-        } => ProviderCommands::setup(ctx, &provider_type, instance_id.as_deref()).await,
+        } => ProviderCommands::setup(ctx, &provider_type, instance_id.as_deref(), false).await,
         ProviderSubcommands::Health { provider_id } => {
             ProviderCommands::health(ctx, provider_id.as_deref()).await
         }
@@ -812,7 +810,7 @@ async fn run_launcher_command(
         LauncherSubcommands::Setup {
             launcher_type,
             instance_id,
-        } => LauncherCommands::setup(ctx, &launcher_type, instance_id.as_deref()).await,
+        } => LauncherCommands::setup(ctx, &launcher_type, instance_id.as_deref(), false).await,
         LauncherSubcommands::Remove { launcher_id } => LauncherCommands::remove(ctx, &launcher_id),
     }
 }
@@ -830,15 +828,18 @@ async fn run_launch(
     use crate::session;
 
     // Load config fresh so we always pick up the latest saved state.
-    ctx.config = crate::config::Config::new()?;
+    ctx.set_config(crate::config::Config::new()?);
 
     // Configuration integrity first, before anything about the environment.
     LauncherCommands::prelaunch(ctx, launcher_id).await?;
 
-    let ui: &dyn Ui = &*ctx.ui;
-    let config = ctx.config.clone();
+    // A handle rather than a borrow of `ctx`: starting the session proxy
+    // below takes `ctx` mutably, to point its sources at the proxy.
+    let ui = std::sync::Arc::clone(&ctx.ui);
+    let ui: &dyn Ui = ui.as_ref();
 
-    let lc = config
+    let lc = ctx
+        .config()
         .get_launcher(launcher_id)
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -864,7 +865,10 @@ async fn run_launch(
     //
     // Skipped entirely under `dry_run`: there is no subprocess to point a
     // proxy at, and showing the real upstream URL in the overlay is more
-    // useful than a not-yet-running one.
+    // useful than a not-yet-running one. When booted, it goes on the
+    // application context, so every provider its sources hand out from then
+    // on points at the proxy and a capability resolved against them is
+    // routed through it, and tracked when a tracker is active.
     let boot_proxy = !dry_run;
     let proxy_server = if boot_proxy {
         Some(ProxyServer::start()?)
@@ -872,9 +876,13 @@ async fn run_launch(
         None
     };
     if let Some(server) = &proxy_server {
-        crate::proxy::register_proxy_routes(&config, &lc.enabled_capabilities, &server.handle, ui);
+        // The set built before this point pointed at the real upstreams, so
+        // it goes: from here every provider handed out points at the proxy,
+        // and so does every capability resolved against it below.
+        ctx.set_model_proxy(server.handle.clone());
     }
     let model_proxy = proxy_server.as_ref().map(|s| s.handle.clone());
+    let sources = ctx.sources();
 
     // Compute the tracker early so the LaunchContext can hold it (e.g. for Bob,
     // which has no model-configuration capability and so never makes a request
@@ -890,7 +898,7 @@ async fn run_launch(
         .enabled_capabilities
         .iter()
         .filter_map(|id| {
-            let cap_cfg = config.get_capability(id)?;
+            let cap_cfg = ctx.config().get_capability(id)?;
             let cap_meta = CAPABILITY_REGISTRY.get(&cap_cfg.capability_type)?;
             Some((cap_cfg.clone(), cap_meta.dependencies.clone()))
         })
@@ -901,7 +909,7 @@ async fn run_launch(
     // starting.
     let session_id = session::generate_session_id();
     let session_meta =
-        session::create_session_meta(&session_id, &config, &lc, &capabilities_with_deps);
+        session::create_session_meta(&session_id, ctx.config(), &lc, &capabilities_with_deps);
     session::write_session_file(&session_meta).ok();
 
     let mut launcher = LAUNCHER_REGISTRY
@@ -917,41 +925,24 @@ async fn run_launch(
         model_proxy: model_proxy.clone(),
     };
 
-    // Bind each enabled capability to the launcher before launching. Kept
-    // alive (not dropped at the end of this loop) so a capability that owns
-    // a process-scoped resource -- e.g. `VisionMCPCapability`'s in-process
-    // MCP server -- survives long enough for `on_shutdown` to tear it down
-    // after the launched process exits, not before it starts.
-    let mut bound_capabilities: Vec<Box<dyn crate::capabilities::ResolvedCapability>> = Vec::new();
-    for cap_id in &lc.enabled_capabilities {
-        let cap_cfg = config.get_capability(cap_id).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Launcher '{launcher_id}' references capability '{cap_id}' \
-                 which is not configured. Run `granite-cli capability setup` first."
-            )
-        })?;
-        let capability = CAPABILITY_REGISTRY
-            .construct(
-                &cap_cfg.capability_type,
-                &cap_cfg.capability_id,
-                &cap_cfg.config,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to construct capability '{cap_id}': {e}"))?;
-        // This path builds through the registry rather than through
-        // `CapabilitySource`, so it wires the capability to what it names
-        // itself. `models` is built from the launch's own configuration, so a
-        // proxied launch resolves proxied providers. Resolution returns the
-        // form that binds, so the bind below cannot run against an
-        // unresolved capability.
-        let capability = capability
-            .resolve_refs(&crate::models::ModelSource::with_proxy(
-                &config,
-                model_proxy.clone(),
-            ))
-            .map_err(|e| anyhow::anyhow!("Capability '{cap_id}': {e}"))?;
-        capability.on_setup().await?;
-        launcher.bind_capability(capability.as_ref()).await?;
-        bound_capabilities.push(capability);
+    // Every enabled capability resolves before the first one binds, so a
+    // capability that cannot be built leaves the launcher untouched. What
+    // resolved is kept alive past this point, so a capability that owns a
+    // process-scoped resource -- e.g. `VisionMCPCapability`'s in-process MCP
+    // server -- survives long enough for `on_shutdown` to tear it down after
+    // the launched process exits, not before it starts.
+    let bound_capabilities = crate::launchers::resolve_and_bind(
+        launcher.as_mut(),
+        &lc.enabled_capabilities,
+        &sources.capabilities(),
+    )
+    .await?;
+
+    // One route per model the bound capabilities name, registered before
+    // anything is launched at them. The target is the real upstream, read
+    // through the source's upstream view, which the swap above does not hide.
+    if let Some(server) = &proxy_server {
+        crate::proxy::register_proxy_routes(ctx, &lc.enabled_capabilities, &server.handle, ui);
     }
 
     for capability in &bound_capabilities {

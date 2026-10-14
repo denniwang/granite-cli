@@ -79,7 +79,7 @@ impl ProviderCommands {
     pub fn list(ctx: &crate::AppContext) -> Result<()> {
         let notes = crate::commands::shared::remediation::dangling_notes(ctx, RefKind::Provider);
         let mut rows: Vec<Vec<String>> = ctx
-            .config
+            .config()
             .providers
             .iter()
             .map(|(id, cfg)| {
@@ -114,7 +114,7 @@ impl ProviderCommands {
     }
 
     pub fn info(ctx: &crate::AppContext, id: &str) -> Result<()> {
-        let configured = ctx.config.get_provider(id);
+        let configured = ctx.config().get_provider(id);
 
         let metadata = configured
             .and_then(|p| PROVIDER_REGISTRY.get(&p.provider_type))
@@ -203,10 +203,13 @@ impl ProviderCommands {
     /// defaults to `provider_type` when not given, but a caller may pass a
     /// different value to configure multiple named instances of one type
     /// (e.g. `openai-compatible` backing `llama-cpp`, `ollama`, `lm-studio`).
+    /// `force_overwrite` skips the "already configured, overwrite?" prompt,
+    /// for callers that have already obtained confirmation (e.g. remediation).
     pub async fn setup(
         ctx: &mut crate::AppContext,
         provider_type: &str,
         instance_id: Option<&str>,
+        force_overwrite: bool,
     ) -> Result<()> {
         let provider_def = match PROVIDER_REGISTRY.get(provider_type) {
             Some(def) => def,
@@ -251,8 +254,8 @@ impl ProviderCommands {
         }
 
         // Check if this instance is already configured
-        let existing_config = ctx.config.get_provider(&instance_id);
-        if existing_config.is_some() {
+        let existing_config = ctx.config().get_provider(&instance_id);
+        if existing_config.is_some() && !force_overwrite {
             let overwrite = ctx.ui.confirm(
                 &format!("Provider instance '{instance_id}' is already configured. Overwrite?"),
                 false,
@@ -281,7 +284,7 @@ impl ProviderCommands {
             config,
         };
 
-        ctx.config
+        ctx.config_mut()
             .insert_provider(&instance_id, provider_config)
             .map_err(|e| anyhow::anyhow!("failed to save provider config: {e}"))?;
 
@@ -321,7 +324,7 @@ impl ProviderCommands {
     pub async fn health(ctx: &mut crate::AppContext, provider_id: Option<&str>) -> Result<()> {
         let providers_to_check: Vec<String> = match provider_id {
             Some(id) => vec![id.to_string()],
-            None => ctx.config.providers.keys().cloned().collect(),
+            None => ctx.config().providers.keys().cloned().collect(),
         };
 
         if providers_to_check.is_empty() {
@@ -353,7 +356,7 @@ impl ProviderCommands {
     /// Deletes the provider's config file and removes it from the in-memory
     /// config. After this call `provider list` will no longer show the entry.
     pub fn remove(ctx: &mut crate::AppContext, provider_id: &str) -> Result<()> {
-        if ctx.config.get_provider(provider_id).is_none() {
+        if ctx.config().get_provider(provider_id).is_none() {
             anyhow::bail!("No provider configured with id '{provider_id}'. Nothing to remove.");
         }
 
@@ -372,7 +375,7 @@ impl ProviderCommands {
             }
         }
 
-        if let Err(e) = ctx.config.remove_provider(provider_id) {
+        if let Err(e) = ctx.config_mut().remove_provider(provider_id) {
             ctx.ui
                 .warn(&format!("failed to persist provider removal: {e}"));
         }
@@ -384,7 +387,7 @@ impl ProviderCommands {
         ctx: &crate::AppContext,
         provider_id: &str,
     ) -> Result<HealthStatus> {
-        let provider_config = ctx.config.get_provider(provider_id).ok_or_else(|| {
+        let provider_config = ctx.config().get_provider(provider_id).ok_or_else(|| {
             anyhow::anyhow!("Provider '{provider_id}' not found in configuration")
         })?;
 
@@ -412,15 +415,12 @@ mod tests {
     use std::sync::Arc;
 
     fn test_ctx() -> crate::AppContext {
-        crate::AppContext {
-            config: Config::default(),
-            ui: Arc::new(CaptureUi::default()),
-        }
+        crate::AppContext::new(Config::default(), Arc::new(CaptureUi::default()))
     }
 
     fn ctx_with_provider(id: &str, url: &str) -> crate::AppContext {
         let mut ctx = test_ctx();
-        ctx.config.providers.insert(
+        ctx.config_mut().providers.insert(
             id.to_string(),
             ProviderConfig {
                 provider_id: id.to_string(),
@@ -548,7 +548,7 @@ mod tests {
     #[test]
     fn list_sorted_by_type_then_id() {
         let mut ctx = test_ctx();
-        ctx.config.providers.insert(
+        ctx.config_mut().providers.insert(
             "prod-openai".to_string(),
             ProviderConfig {
                 provider_id: "prod-openai".to_string(),
@@ -556,7 +556,7 @@ mod tests {
                 config: serde_json::json!({ "base_url": "http://prod" }),
             },
         );
-        ctx.config.providers.insert(
+        ctx.config_mut().providers.insert(
             "local-ollama".to_string(),
             ProviderConfig {
                 provider_id: "local-ollama".to_string(),
@@ -564,7 +564,7 @@ mod tests {
                 config: serde_json::json!({ "base_url": "http://localhost:11434" }),
             },
         );
-        ctx.config.providers.insert(
+        ctx.config_mut().providers.insert(
             "dev-openai".to_string(),
             ProviderConfig {
                 provider_id: "dev-openai".to_string(),
@@ -643,7 +643,7 @@ mod tests {
     #[test]
     fn info_configured_unknown_type_renders_note() {
         let mut ctx = test_ctx();
-        ctx.config.providers.insert(
+        ctx.config_mut().providers.insert(
             "custom-provider".to_string(),
             ProviderConfig {
                 provider_id: "custom-provider".to_string(),
@@ -676,7 +676,7 @@ mod tests {
         let mut ctx = test_ctx();
 
         home.make_unwritable();
-        let result = ProviderCommands::setup(&mut ctx, "ollama", Some("test-ollama")).await;
+        let result = ProviderCommands::setup(&mut ctx, "ollama", Some("test-ollama"), false).await;
         home.make_writable();
 
         assert!(result.is_err());
@@ -709,11 +709,11 @@ mod tests {
     fn remove_existing_provider_succeeds_and_disappears_from_list() {
         let _home = crate::config::TestConfigHome::new();
         let mut ctx = ctx_with_provider("my-ollama", "http://localhost:11434");
-        assert!(ctx.config.get_provider("my-ollama").is_some());
+        assert!(ctx.config().get_provider("my-ollama").is_some());
 
         ProviderCommands::remove(&mut ctx, "my-ollama").unwrap();
 
-        assert!(ctx.config.get_provider("my-ollama").is_none());
+        assert!(ctx.config().get_provider("my-ollama").is_none());
         let infos = infos!(ctx);
         assert!(
             infos

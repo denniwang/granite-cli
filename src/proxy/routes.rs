@@ -15,16 +15,17 @@ use crate::utils::ui::Ui;
 /// The launch path calls this because it needs four things at once that no
 /// single collection has: the model, the variant it was configured with, its
 /// provider's real connection details, and the proxy handle. The details come
-/// from the source's upstream view, since a provider handed out by `get`
-/// reports the proxy's own address, which is not what the route points at.
+/// from the context's own sources, read through their upstream view, since a
+/// provider handed out by `get` reports the proxy's own address once the
+/// handle is set.
 pub(crate) fn register_proxy_routes(
-    config: &crate::config::Config,
+    ctx: &crate::AppContext,
     enabled_capabilities: &[String],
     handle: &super::ProxyHandle,
     ui: &dyn Ui,
 ) {
-    let source = crate::models::ModelSource::from_config(config);
-    for model_id in model_ids_named_by(config, enabled_capabilities) {
+    let source = ctx.sources().models();
+    for model_id in model_ids_named_by(ctx.config(), enabled_capabilities) {
         let Ok(provider) = source.upstream_for(&model_id) else {
             continue;
         };
@@ -66,10 +67,7 @@ fn model_ids_named_by(config: &crate::config::Config, capability_ids: &[String])
         let Some(cc) = config.get_capability(capability_id) else {
             continue;
         };
-        let Ok(refs) = cc.refs() else {
-            continue;
-        };
-        for (kind, id) in refs {
+        for (kind, id) in cc.refs() {
             if kind == RefKind::Model && !ids.iter().any(|seen| seen == id) {
                 ids.push(id.to_string());
             }

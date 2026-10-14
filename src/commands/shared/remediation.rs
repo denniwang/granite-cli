@@ -52,7 +52,7 @@ pub(crate) enum Outcome {
 /// A list reports that a problem exists and never prompts about it. Acting on
 /// it is left to a command the user chooses to run next.
 pub(crate) fn dangling_notes(ctx: &crate::AppContext, kind: RefKind) -> HashMap<String, String> {
-    find_dangling(kind, &ctx.config)
+    find_dangling(kind, ctx.config(), &ctx.sources())
         .into_iter()
         .map(|dangling| {
             (
@@ -79,7 +79,7 @@ pub(crate) fn prompt_with_current(
         return prompt.to_string();
     };
 
-    match validate_ref(kind, current, &ctx.config) {
+    match validate_ref(kind, current, ctx.config(), &ctx.sources()) {
         Ok(()) => format!("{prompt} [current: '{current}']"),
         Err(_) => format!(
             "{prompt} [current: '{current}', {} no longer resolves]",
@@ -105,14 +105,14 @@ pub(crate) enum Removal {
 /// Nothing pointing at it means no prompt. A session with nobody to ask
 /// removes only what was asked for, after saying what that breaks.
 pub(crate) fn confirm_removal(ctx: &crate::AppContext, kind: RefKind, id: &str) -> Result<Removal> {
-    let stranded = dependents(kind, id, &ctx.config);
+    let stranded = dependents(kind, id, ctx.config());
     if stranded.is_empty() {
         return Ok(Removal::Proceed { with: stranded });
     }
 
     ctx.ui.warn(&format!("Removing {kind} '{id}' will break:"));
     for (dependent_kind, dependent_id) in &stranded {
-        let type_suffix = type_name(*dependent_kind, dependent_id, &ctx.config)
+        let type_suffix = type_name(*dependent_kind, dependent_id, ctx.config())
             .map(|t| format!(" ({t})"))
             .unwrap_or_default();
         ctx.ui.info(&format!(
@@ -192,7 +192,7 @@ pub(crate) async fn remediate(
     let mut tried: Vec<Choice> = Vec::new();
 
     loop {
-        let Err(error) = validate_ref(kind, id, &ctx.config) else {
+        let Err(error) = validate_ref(kind, id, ctx.config(), &ctx.sources()) else {
             return Ok(Outcome::Clean);
         };
 
@@ -205,7 +205,7 @@ pub(crate) async fn remediate(
             tried.clear();
         }
 
-        let Some(fix) = Fix::for_error(&error, &ctx.config, (kind, id)) else {
+        let Some(fix) = Fix::for_error(&error, ctx.config(), (kind, id)) else {
             // The instance the caller asked about is itself missing, so
             // there is nothing to offer: reconfiguring or removing needs
             // something that exists.
@@ -229,6 +229,10 @@ pub(crate) async fn remediate(
             Choice::Reconfigure => {
                 previous = Some(error);
                 reconfigure(ctx, &fix).await?;
+            }
+            Choice::Reset => {
+                previous = Some(error);
+                reset(ctx, &fix)?;
             }
             Choice::Remove => {
                 previous = Some(error);
@@ -257,6 +261,13 @@ struct Fix {
     /// False when the type name is itself the problem. Setup cannot run a
     /// type the registry does not have, so removal is the only fix.
     can_reconfigure: bool,
+    /// What resetting would change, when the problem is settings that are not
+    /// valid and replacing some of them with this type's defaults leaves an
+    /// instance that builds. `None` when no such replacement exists, which is
+    /// the case for a type whose defaults carry the same unusable value (an
+    /// `agent-model` capability's default model id is empty, like the one
+    /// that is not valid).
+    reset: Option<ResetPlan>,
     /// The `(launcher, capability)` pair to disable, when remediation was
     /// reached through a launcher that enables the capability. Some means the
     /// removal on offer drops the id from that launcher's list rather than
@@ -275,13 +286,146 @@ impl Fix {
             _ => error.target.clone(),
         };
 
+        let type_name = type_name(kind, &id, config)?.to_string();
+        let reset = match &error.problem {
+            Problem::UnreadableSettings { .. } => {
+                plan_reset(kind, &type_name, settings(kind, &id, config)?)
+            }
+            _ => None,
+        };
         Some(Self {
-            type_name: type_name(kind, &id, config)?.to_string(),
             can_reconfigure: !matches!(error.problem, Problem::UnknownType { .. }),
+            reset,
+            type_name,
             disable: disable_target(error, kind, &id, root, config),
             kind,
             id,
         })
+    }
+}
+
+/// The settings an instance carries, which is what a reset works from.
+fn settings<'a>(kind: RefKind, id: &str, config: &'a Config) -> Option<&'a serde_json::Value> {
+    match kind {
+        RefKind::Launcher => config.get_launcher(id).map(|c| &c.config),
+        RefKind::Capability => config.get_capability(id).map(|c| &c.config),
+        RefKind::Model => config.get_model(id).map(|c| &c.config),
+        RefKind::Provider => config.get_provider(id).map(|c| &c.config),
+    }
+}
+
+/// The settings a reset would write, and the fields it would change to get
+/// there.
+#[derive(Debug, PartialEq, Eq)]
+struct ResetPlan {
+    /// The settings to write: the instance's own, with the fields below
+    /// replaced by this type's defaults.
+    settings: serde_json::Value,
+    /// Each field the reset replaces, with the default value it takes.
+    changes: Vec<(String, serde_json::Value)>,
+}
+
+impl ResetPlan {
+    /// What the prompt offers, naming the fields and the values they take, so
+    /// nobody accepts a repair without knowing what it moves.
+    fn describe(&self, kind: RefKind, id: &str) -> String {
+        let render = |value: &serde_json::Value| match value {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        match self.changes.as_slice() {
+            [(field, value)] => format!(
+                "Reset {kind} '{id}' {field} setting to its default value of {}",
+                render(value)
+            ),
+            changes => format!(
+                "Reset {kind} '{id}' settings to their default values: {}",
+                changes
+                    .iter()
+                    .map(|(field, value)| format!("{field} {}", render(value)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
+/// A replacement of some of an instance's settings by its type's defaults
+/// that builds, or `None` when no replacement does.
+///
+/// The settings blob is valid JSON; it is reading it as the type's config that
+/// failed, and usually over one field. So each field that differs from the
+/// default is tried on its own first. When no single field is enough, the
+/// differing fields are replaced one after another, in the order the defaults
+/// list them, and the first set that builds is the plan. That set can include
+/// fields that did not need replacing. Construction reads settings and does no
+/// I/O, so trying a few is cheap.
+fn plan_reset(kind: RefKind, type_name: &str, current: &serde_json::Value) -> Option<ResetPlan> {
+    let defaults = default_settings(kind, type_name)?;
+    let (Some(current_fields), Some(default_fields)) = (current.as_object(), defaults.as_object())
+    else {
+        return constructs(kind, type_name, &defaults).then(|| ResetPlan {
+            settings: defaults.clone(),
+            changes: Vec::new(),
+        });
+    };
+
+    let differing: Vec<(&String, &serde_json::Value)> = default_fields
+        .iter()
+        .filter(|(field, value)| current_fields.get(*field) != Some(*value))
+        .collect();
+
+    for (field, value) in &differing {
+        let mut candidate = current.clone();
+        candidate[field.as_str()] = (*value).clone();
+        if constructs(kind, type_name, &candidate) {
+            return Some(ResetPlan {
+                settings: candidate,
+                changes: vec![((*field).clone(), (*value).clone())],
+            });
+        }
+    }
+
+    let mut candidate = current.clone();
+    let mut changes = Vec::new();
+    for (field, value) in differing {
+        candidate[field.as_str()] = value.clone();
+        changes.push((field.clone(), value.clone()));
+        if constructs(kind, type_name, &candidate) {
+            return Some(ResetPlan {
+                settings: candidate,
+                changes,
+            });
+        }
+    }
+    None
+}
+
+/// Whether these settings produce an instance of this type.
+fn constructs(kind: RefKind, type_name: &str, settings: &serde_json::Value) -> bool {
+    match kind {
+        RefKind::Launcher => crate::launchers::LAUNCHER_REGISTRY
+            .construct(type_name, type_name, settings)
+            .is_ok(),
+        RefKind::Capability => crate::capabilities::CAPABILITY_REGISTRY
+            .construct(type_name, type_name, settings)
+            .is_ok(),
+        RefKind::Model => crate::models::MODEL_REGISTRY
+            .construct(type_name, type_name, settings)
+            .is_ok(),
+        RefKind::Provider => crate::providers::PROVIDER_REGISTRY
+            .construct(type_name, type_name, settings)
+            .is_ok(),
+    }
+}
+
+/// A type's default settings, as its registry entry declares them.
+fn default_settings(kind: RefKind, type_name: &str) -> Option<serde_json::Value> {
+    match kind {
+        RefKind::Launcher => crate::launchers::LAUNCHER_REGISTRY.default_config(type_name),
+        RefKind::Capability => crate::capabilities::CAPABILITY_REGISTRY.default_config(type_name),
+        RefKind::Model => crate::models::MODEL_REGISTRY.default_config(type_name),
+        RefKind::Provider => crate::providers::PROVIDER_REGISTRY.default_config(type_name),
     }
 }
 
@@ -326,6 +470,7 @@ fn disable_target(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Choice {
     Reconfigure,
+    Reset,
     Remove,
     Disable,
     Decline,
@@ -346,6 +491,13 @@ fn choose(
     if fix.can_reconfigure && !tried.contains(&Choice::Reconfigure) {
         choices.push(Choice::Reconfigure);
         items.push(format!("Reconfigure {} '{}' now", fix.kind, fix.id.clone()));
+    }
+
+    if let Some(plan) = &fix.reset
+        && !tried.contains(&Choice::Reset)
+    {
+        choices.push(Choice::Reset);
+        items.push(plan.describe(fix.kind, &fix.id));
     }
 
     match &fix.disable {
@@ -382,14 +534,63 @@ fn choose(
 
 /// Runs the instance's own setup command against the instance, which is what
 /// the user would run by hand to change what it points at.
+///
+/// Passes `force_overwrite: true` so the wizard does not ask a second
+/// "already configured, overwrite?" question — the choice made at the
+/// remediation prompt was already that confirmation.
 async fn reconfigure(ctx: &mut crate::AppContext, fix: &Fix) -> Result<()> {
     let (kind, type_name, id) = (fix.kind, fix.type_name.as_str(), Some(fix.id.as_str()));
     match kind {
-        RefKind::Launcher => LauncherCommands::setup(ctx, type_name, id).await,
-        RefKind::Capability => CapabilityCommands::setup(ctx, type_name, id).await,
-        RefKind::Model => ModelCommands::setup(ctx, type_name, id).await,
-        RefKind::Provider => ProviderCommands::setup(ctx, type_name, id).await,
+        RefKind::Launcher => LauncherCommands::setup(ctx, type_name, id, true).await,
+        RefKind::Capability => CapabilityCommands::setup(ctx, type_name, id, true).await,
+        RefKind::Model => ModelCommands::setup(ctx, type_name, id, true).await,
+        RefKind::Provider => ProviderCommands::setup(ctx, type_name, id, true).await,
     }
+}
+
+/// Replaces the fields that are not valid with their type's defaults, and
+/// keeps everything else the instance was configured with. Reconfiguring also
+/// repairs the instance, but setup offers the instance's current values, and
+/// for a field whose value is not valid it offers a zero value (`0` for a
+/// number, `false` for a flag). Accepting those writes that value, where this
+/// writes the type's default.
+fn reset(ctx: &mut crate::AppContext, fix: &Fix) -> Result<()> {
+    let Some(plan) = &fix.reset else {
+        return Ok(());
+    };
+    let defaults = plan.settings.clone();
+    let (kind, id) = (fix.kind, fix.id.clone());
+    // The in-memory change lands either way, which is what the walk about to
+    // re-run reads. A failure to persist is reported the way the removal
+    // commands report theirs.
+    let saved = match kind {
+        RefKind::Launcher => ctx
+            .config_mut()
+            .update_launcher(&id, |launcher| launcher.config = defaults),
+        RefKind::Capability => ctx
+            .config_mut()
+            .update_capability(&id, |capability| capability.config = defaults),
+        RefKind::Model => ctx
+            .config_mut()
+            .update_model(&id, |model| model.config = defaults),
+        RefKind::Provider => ctx
+            .config_mut()
+            .update_provider(&id, |provider| provider.config = defaults),
+    };
+    if let Err(e) = saved {
+        ctx.ui
+            .warn(&format!("failed to persist the change to '{id}': {e}"));
+    }
+    ctx.ui.info(&format!(
+        "{kind} '{id}': {} now holds the default from '{}'.",
+        plan.changes
+            .iter()
+            .map(|(field, _)| field.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        fix.type_name
+    ));
+    Ok(())
 }
 
 /// Drops the capability from the launcher's `enabled_capabilities`. The
@@ -402,7 +603,7 @@ fn disable(ctx: &mut crate::AppContext, fix: &Fix) -> Result<()> {
     // The in-memory change lands either way, which is what the walk about to
     // re-run reads. A failure to persist is reported the way the removal
     // commands report theirs.
-    if let Err(e) = ctx.config.update_launcher(&launcher_id, |launcher| {
+    if let Err(e) = ctx.config_mut().update_launcher(&launcher_id, |launcher| {
         launcher
             .enabled_capabilities
             .retain(|id| id != &capability_id)
@@ -459,16 +660,119 @@ mod tests {
             .collect()
     }
 
+    /// A provider whose settings hold a field of the wrong type, which is
+    /// the state the reset repair exists for.
+    fn ctx_with_unreadable_provider_settings() -> crate::AppContext {
+        let mut ctx = crate::AppContext::new(Config::default(), Arc::new(CaptureUi::default()));
+        ctx.config_mut().providers.insert(
+            "ollama".to_string(),
+            ProviderConfig {
+                provider_id: "ollama".to_string(),
+                provider_type: "ollama".to_string(),
+                // A deliberately chosen endpoint beside a field that cannot
+                // be read, which is what a scoped repair has to tell apart.
+                config: serde_json::json!({
+                    "base_url": "http://127.0.0.1:18080",
+                    "timeout_secs": "ten",
+                }),
+            },
+        );
+        ctx
+    }
+
+    #[tokio::test]
+    async fn a_reset_replaces_the_field_that_cannot_be_read_and_keeps_the_rest() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = ctx_with_unreadable_provider_settings();
+        // Reconfigure, reset, remove, decline: reset is the second.
+        answer(&ctx, &[1]);
+
+        let outcome = remediate(
+            &mut ctx,
+            RefKind::Provider,
+            "ollama",
+            OnDecline::Abort,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::Clean);
+        let settings = &ctx.config().get_provider("ollama").unwrap().config;
+        assert_eq!(
+            settings.get("timeout_secs"),
+            crate::providers::PROVIDER_REGISTRY
+                .default_config("ollama")
+                .as_ref()
+                .and_then(|defaults| defaults.get("timeout_secs")),
+            "the field that could not be read now holds its type's default"
+        );
+        assert_eq!(
+            settings.get("base_url").and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:18080"),
+            "a field that reads fine is left as it was configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reset_on_offer_names_the_field_and_the_value_it_takes() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = ctx_with_unreadable_provider_settings();
+
+        let _ = remediate(
+            &mut ctx,
+            RefKind::Provider,
+            "ollama",
+            OnDecline::Abort,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let offered = &prompts(&ctx)[0].1;
+        assert!(
+            offered.iter().any(|item| item
+                == "Reset provider 'ollama' timeout_secs setting to its default value of 10"),
+            "got: {offered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reset_is_not_offered_when_the_defaults_would_not_help() {
+        // `agent-model`'s default settings hold an empty model id, the same
+        // value that is not valid here, so resetting repairs nothing and is
+        // not offered.
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = crate::AppContext::new(Config::default(), Arc::new(CaptureUi::default()));
+        ctx.config_mut().capabilities.insert(
+            "chat".to_string(),
+            CapabilityConfig {
+                capability_id: "chat".to_string(),
+                capability_type: "agent-model".to_string(),
+                config: serde_json::json!({ "model_id": "" }),
+            },
+        );
+
+        let _ = remediate(&mut ctx, RefKind::Capability, "chat", OnDecline::Skip, true)
+            .await
+            .unwrap();
+
+        let offered = prompts(&ctx);
+        assert!(!offered.is_empty(), "the problem was reported");
+        assert!(
+            !offered[0].1.iter().any(|item| item.contains("Reset")),
+            "got: {:?}",
+            offered[0].1
+        );
+    }
+
     /// Launcher `claude` enables capability `chat`, which points at a model
     /// that is not configured. One healthy model satisfies `agent-model`'s
     /// Chat requirement, so reconfiguring `chat` picks it without a prompt
     /// of its own.
     fn ctx_with_a_dangling_model_ref() -> crate::AppContext {
-        let mut ctx = crate::AppContext {
-            config: Config::default(),
-            ui: Arc::new(CaptureUi::default()),
-        };
-        ctx.config.providers.insert(
+        let mut ctx = crate::AppContext::new(Config::default(), Arc::new(CaptureUi::default()));
+        ctx.config_mut().providers.insert(
             "ollama".to_string(),
             ProviderConfig {
                 provider_id: "ollama".to_string(),
@@ -476,7 +780,7 @@ mod tests {
                 config: serde_json::json!({}),
             },
         );
-        ctx.config.models.insert(
+        ctx.config_mut().models.insert(
             "granite-3.1-8b-instruct".to_string(),
             ModelConfig {
                 model_id: "granite-3.1-8b-instruct".to_string(),
@@ -486,7 +790,7 @@ mod tests {
                 config: serde_json::json!({}),
             },
         );
-        ctx.config.capabilities.insert(
+        ctx.config_mut().capabilities.insert(
             "chat".to_string(),
             CapabilityConfig {
                 capability_id: "chat".to_string(),
@@ -494,7 +798,7 @@ mod tests {
                 config: serde_json::json!({ "model_id": "gone" }),
             },
         );
-        ctx.config.launchers.insert(
+        ctx.config_mut().launchers.insert(
             "claude".to_string(),
             LauncherConfig {
                 launcher_id: "claude".to_string(),
@@ -510,9 +814,12 @@ mod tests {
     /// the capability, so removing it strands nothing further.
     fn ctx_model_with_one_dependent() -> crate::AppContext {
         let mut ctx = ctx_with_a_dangling_model_ref();
-        ctx.config.launchers.clear();
-        ctx.config.capabilities.get_mut("chat").unwrap().config =
-            serde_json::json!({ "model_id": "granite-3.1-8b-instruct" });
+        ctx.config_mut().launchers.clear();
+        ctx.config_mut()
+            .capabilities
+            .get_mut("chat")
+            .unwrap()
+            .config = serde_json::json!({ "model_id": "granite-3.1-8b-instruct" });
         ctx
     }
 
@@ -524,8 +831,8 @@ mod tests {
 
         ModelCommands::remove(&mut ctx, "granite-3.1-8b-instruct").unwrap();
 
-        assert!(ctx.config.get_model("granite-3.1-8b-instruct").is_none());
-        assert!(ctx.config.get_capability("chat").is_none());
+        assert!(ctx.config().get_model("granite-3.1-8b-instruct").is_none());
+        assert!(ctx.config().get_capability("chat").is_none());
     }
 
     #[test]
@@ -536,8 +843,8 @@ mod tests {
 
         ModelCommands::remove(&mut ctx, "granite-3.1-8b-instruct").unwrap();
 
-        assert!(ctx.config.get_model("granite-3.1-8b-instruct").is_some());
-        assert!(ctx.config.get_capability("chat").is_some());
+        assert!(ctx.config().get_model("granite-3.1-8b-instruct").is_some());
+        assert!(ctx.config().get_capability("chat").is_some());
     }
 
     #[test]
@@ -548,10 +855,10 @@ mod tests {
 
         ModelCommands::remove(&mut ctx, "granite-3.1-8b-instruct").unwrap();
 
-        assert!(ctx.config.get_model("granite-3.1-8b-instruct").is_none());
+        assert!(ctx.config().get_model("granite-3.1-8b-instruct").is_none());
         // Left in place, and now dangling, which `capability list` reports.
-        assert!(ctx.config.get_capability("chat").is_some());
-        assert!(!find_dangling(RefKind::Capability, &ctx.config).is_empty());
+        assert!(ctx.config().get_capability("chat").is_some());
+        assert!(!find_dangling(RefKind::Capability, ctx.config(), &ctx.sources()).is_empty());
     }
 
     #[test]
@@ -563,8 +870,8 @@ mod tests {
         ModelCommands::remove(&mut ctx, "granite-3.1-8b-instruct").unwrap();
 
         assert!(prompts(&ctx).is_empty());
-        assert!(ctx.config.get_model("granite-3.1-8b-instruct").is_none());
-        assert!(ctx.config.get_capability("chat").is_some());
+        assert!(ctx.config().get_model("granite-3.1-8b-instruct").is_none());
+        assert!(ctx.config().get_capability("chat").is_some());
         // The user is told what was broken even though nothing was asked.
         let warns = capture(&ctx).warns.borrow().clone();
         assert!(warns.iter().any(|w| w.contains("will break")), "{warns:?}");
@@ -578,7 +885,7 @@ mod tests {
         CapabilityCommands::remove(&mut ctx, "chat").unwrap();
 
         assert!(prompts(&ctx).is_empty());
-        assert!(ctx.config.get_capability("chat").is_none());
+        assert!(ctx.config().get_capability("chat").is_none());
     }
 
     #[tokio::test]
@@ -604,10 +911,9 @@ mod tests {
         let _home = crate::config::TestConfigHome::new();
         let mut ctx = ctx_with_a_dangling_model_ref();
         answer(&ctx, &[0]);
-        // Setup asks its own "already configured, overwrite?" confirmation
-        // on top of the choice made here. Declining it leaves the reference
-        // broken, which the loop then reports rather than asking again.
-        capture(&ctx).confirm_answers.borrow_mut().push_back(true);
+        // Remediation passes force_overwrite=true to setup, so no
+        // "already configured, overwrite?" confirm appears — the choice made
+        // at the remediation prompt is the only confirmation needed.
 
         let outcome = remediate(&mut ctx, RefKind::Capability, "chat", OnDecline::Skip, true)
             .await
@@ -616,7 +922,7 @@ mod tests {
         // Setup ran against `chat`, the capability holding the broken
         // reference, not against the model that is missing.
         assert_eq!(
-            ctx.config
+            ctx.config()
                 .get_capability("chat")
                 .and_then(|c| c.config.get("model_id"))
                 .and_then(|v| v.as_str()),
@@ -630,6 +936,11 @@ mod tests {
         assert!(
             items[0].contains("Reconfigure capability 'chat'"),
             "{items:?}"
+        );
+        // No overwrite confirm was issued.
+        assert!(
+            capture(&ctx).confirm_answers.borrow().is_empty(),
+            "no canned confirms were consumed, so no confirm was issued"
         );
     }
 
@@ -645,7 +956,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(ctx.config.get_capability("chat").is_none());
+        assert!(ctx.config().get_capability("chat").is_none());
         // What the caller asked about is gone, so it does not validate.
         assert_eq!(outcome, Outcome::Unresolved);
     }
@@ -656,7 +967,7 @@ mod tests {
         let mut ctx = ctx_with_a_dangling_model_ref();
         // A second broken capability, so repairing the first leaves one more
         // for the loop to find.
-        ctx.config.capabilities.insert(
+        ctx.config_mut().capabilities.insert(
             "vision".to_string(),
             CapabilityConfig {
                 capability_id: "vision".to_string(),
@@ -664,7 +975,7 @@ mod tests {
                 config: serde_json::json!({ "model_id": "also-gone" }),
             },
         );
-        ctx.config
+        ctx.config_mut()
             .launchers
             .get_mut("claude")
             .unwrap()
@@ -710,14 +1021,14 @@ mod tests {
         );
         assert_eq!(outcome, Outcome::Clean);
         assert!(
-            ctx.config
+            ctx.config()
                 .get_launcher("claude")
                 .unwrap()
                 .enabled_capabilities
                 .is_empty()
         );
         assert!(
-            ctx.config.get_capability("chat").is_some(),
+            ctx.config().get_capability("chat").is_some(),
             "the capability stays configured for any other launcher"
         );
     }
@@ -726,7 +1037,7 @@ mod tests {
     async fn a_launch_un_enables_a_capability_that_is_not_configured() {
         let _home = crate::config::TestConfigHome::new();
         let mut ctx = ctx_with_a_dangling_model_ref();
-        ctx.config.capabilities.remove("chat");
+        ctx.config_mut().capabilities.remove("chat");
         answer(&ctx, &[1]);
 
         let outcome = remediate(
@@ -748,7 +1059,7 @@ mod tests {
         );
         assert_eq!(outcome, Outcome::Clean);
         assert!(
-            ctx.config
+            ctx.config()
                 .get_launcher("claude")
                 .unwrap()
                 .enabled_capabilities
@@ -770,52 +1081,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fix_that_changes_nothing_is_not_offered_again() {
+    async fn reconfigure_proceeds_without_an_overwrite_confirm() {
         let _home = crate::config::TestConfigHome::new();
         let mut ctx = ctx_with_a_dangling_model_ref();
         answer(&ctx, &[0]);
-        // Setup asks its own "already configured, overwrite?" confirmation.
-        // Declining it returns having changed nothing, which is the repair
-        // that leaves the same problem behind.
-        capture(&ctx).confirm_answers.borrow_mut().push_back(false);
 
         let outcome = remediate(&mut ctx, RefKind::Capability, "chat", OnDecline::Skip, true)
             .await
             .unwrap();
 
-        // The same problem comes back, without the repair that just changed
-        // nothing. The answer queue is empty by then, so the second prompt
-        // takes its default, which declines.
+        assert_eq!(outcome, Outcome::Clean);
         let prompts = prompts(&ctx);
-        assert_eq!(prompts.len(), 2, "{prompts:?}");
         assert!(prompts[0].1[0].starts_with("Reconfigure"), "{prompts:?}");
-        assert!(
-            !prompts[1].1.iter().any(|i| i.starts_with("Reconfigure")),
-            "the repair that changed nothing is gone: {prompts:?}"
-        );
-        assert!(
-            prompts[1].1[0].starts_with("Remove"),
-            "the other repair is still reachable: {prompts:?}"
-        );
-        assert_eq!(outcome, Outcome::Unresolved);
+        // No overwrite confirm — force_overwrite skips the second prompt.
+        assert!(capture(&ctx).confirm_answers.borrow().is_empty());
         assert_eq!(
-            ctx.config
+            ctx.config()
                 .get_capability("chat")
                 .and_then(|c| c.config.get("model_id"))
                 .and_then(|v| v.as_str()),
-            Some("gone"),
-            "a declined overwrite leaves the configuration alone"
+            Some("granite-3.1-8b-instruct"),
         );
     }
 
     #[tokio::test]
-    async fn a_launch_can_still_un_enable_after_a_reconfiguration_changed_nothing() {
+    async fn a_launch_reconfigure_fixes_the_reference_without_an_overwrite_confirm() {
         let _home = crate::config::TestConfigHome::new();
         let mut ctx = ctx_with_a_dangling_model_ref();
-        // Reconfigure, walk out of the overwrite, then take the repair that
-        // is still on offer rather than having to re-run the command.
-        answer(&ctx, &[0, 0]);
-        capture(&ctx).confirm_answers.borrow_mut().push_back(false);
+        answer(&ctx, &[0]);
 
         let outcome = remediate(
             &mut ctx,
@@ -827,20 +1120,69 @@ mod tests {
         .await
         .unwrap();
 
-        let prompts = prompts(&ctx);
-        assert_eq!(prompts.len(), 2, "{prompts:?}");
-        assert_eq!(
-            prompts[1].1[0], "Remove capability 'chat' from launcher 'claude'",
-            "{prompts:?}"
-        );
         assert_eq!(outcome, Outcome::Clean);
-        assert!(
-            ctx.config
-                .get_launcher("claude")
-                .unwrap()
-                .enabled_capabilities
-                .is_empty()
+
+        // No overwrite confirm — force_overwrite skips the second prompt.
+        assert!(capture(&ctx).confirm_answers.borrow().is_empty());
+        assert_eq!(
+            ctx.config()
+                .get_capability("chat")
+                .and_then(|c| c.config.get("model_id"))
+                .and_then(|v| v.as_str()),
+            Some("granite-3.1-8b-instruct"),
         );
+    }
+
+    fn ctx_with_a_dangling_provider_ref() -> crate::AppContext {
+        let mut ctx = crate::AppContext::new(
+            Config::default(),
+            Arc::new(crate::utils::ui::base::tests::CaptureUi::default()),
+        );
+        ctx.config_mut().providers.insert(
+            "ollama".to_string(),
+            ProviderConfig {
+                provider_id: "ollama".to_string(),
+                provider_type: "ollama".to_string(),
+                config: serde_json::json!({}),
+            },
+        );
+        ctx.config_mut().models.insert(
+            "granite-3.1-8b-instruct".to_string(),
+            ModelConfig {
+                model_id: "granite-3.1-8b-instruct".to_string(),
+                model_type: "granite-3.1-8b-instruct".to_string(),
+                provider_id: "gone-provider".to_string(),
+                variant: None,
+                config: serde_json::json!({}),
+            },
+        );
+        ctx
+    }
+
+    #[tokio::test]
+    async fn reconfigure_model_arm_fixes_a_broken_provider_ref() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = ctx_with_a_dangling_provider_ref();
+        answer(&ctx, &[0]);
+
+        let outcome = remediate(
+            &mut ctx,
+            RefKind::Model,
+            "granite-3.1-8b-instruct",
+            OnDecline::Skip,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::Clean);
+        assert_ne!(
+            ctx.config()
+                .get_model("granite-3.1-8b-instruct")
+                .map(|m| m.provider_id.as_str()),
+            Some("gone-provider"),
+        );
+        assert!(capture(&ctx).confirm_answers.borrow().is_empty());
     }
 
     #[tokio::test]
@@ -855,7 +1197,7 @@ mod tests {
         assert_eq!(outcome, Outcome::Unresolved);
         assert_eq!(prompts(&ctx).len(), 1);
         assert_eq!(
-            ctx.config
+            ctx.config()
                 .get_capability("chat")
                 .and_then(|c| c.config.get("model_id"))
                 .and_then(|v| v.as_str()),
@@ -899,7 +1241,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_type_offers_removal_but_not_reconfiguration() {
         let mut ctx = ctx_with_a_dangling_model_ref();
-        ctx.config
+        ctx.config_mut()
             .models
             .get_mut("granite-3.1-8b-instruct")
             .unwrap()
@@ -946,14 +1288,15 @@ mod tests {
         let _home = crate::config::TestConfigHome::new();
         let mut ctx = ctx_with_a_dangling_model_ref();
         answer(&ctx, &[0]);
-        capture(&ctx).confirm_answers.borrow_mut().push_back(true);
+        // No second confirm needed: force_overwrite bypasses the overwrite
+        // prompt, so the remediation choice is the only confirmation.
 
         crate::commands::LauncherCommands::prelaunch(&mut ctx, "claude")
             .await
             .expect("a repaired configuration launches");
 
         assert_eq!(
-            ctx.config
+            ctx.config()
                 .get_capability("chat")
                 .and_then(|c| c.config.get("model_id"))
                 .and_then(|v| v.as_str()),
@@ -978,5 +1321,40 @@ mod tests {
 
         let (_, items) = &prompts(&ctx)[0];
         assert_eq!(items[2], "Cancel", "{items:?}");
+    }
+
+    // The Launcher and Provider arms of reconfigure() are unreachable via
+    // the normal validation flow, so Fix is constructed directly here.
+    #[tokio::test]
+    async fn reconfigure_launcher_arm_calls_launcher_setup() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = ctx_with_a_dangling_model_ref();
+        let fix = Fix {
+            kind: RefKind::Launcher,
+            id: "claude".to_string(),
+            type_name: "claude".to_string(),
+            can_reconfigure: true,
+            reset: None,
+            disable: None,
+        };
+        // Binary not found in CI is fine — the arm is covered regardless.
+        let _ = reconfigure(&mut ctx, &fix).await;
+    }
+
+    #[tokio::test]
+    async fn reconfigure_provider_arm_calls_provider_setup() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = ctx_with_a_dangling_model_ref();
+        let fix = Fix {
+            kind: RefKind::Provider,
+            id: "ollama".to_string(),
+            type_name: "ollama".to_string(),
+            can_reconfigure: true,
+            reset: None,
+            disable: None,
+        };
+        reconfigure(&mut ctx, &fix).await.unwrap();
+        assert!(ctx.config().get_provider("ollama").is_some());
+        assert!(capture(&ctx).confirm_answers.borrow().is_empty());
     }
 }

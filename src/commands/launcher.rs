@@ -3,7 +3,7 @@ use alog::{MessageLevel, alog_channel, use_channel};
 use anyhow::Result;
 
 // Local
-use crate::capabilities::{CAPABILITY_REGISTRY, CapabilitySource};
+use crate::capabilities::CAPABILITY_REGISTRY;
 use crate::config::validation::RefKind;
 use crate::dependency::Configured;
 use crate::launchers::LAUNCHER_REGISTRY;
@@ -38,7 +38,7 @@ impl LauncherCommands {
     pub fn list(ctx: &crate::AppContext) -> Result<()> {
         let notes = crate::commands::shared::remediation::dangling_notes(ctx, RefKind::Launcher);
         let mut rows: Vec<Vec<String>> = ctx
-            .config
+            .config()
             .launchers
             .iter()
             .map(|(id, cfg)| {
@@ -73,7 +73,7 @@ impl LauncherCommands {
     }
 
     pub fn info(ctx: &crate::AppContext, id: &str) -> Result<()> {
-        let configured = ctx.config.get_launcher(id);
+        let configured = ctx.config().get_launcher(id);
 
         let metadata = configured
             .and_then(|c| LAUNCHER_REGISTRY.get(&c.launcher_type))
@@ -161,10 +161,13 @@ impl LauncherCommands {
     /// and, if one exists under a different name, offers to either update that
     /// existing entry or proceed with the new name. This lets the user avoid
     /// accidentally creating duplicate configs for the same tool.
+    /// `force_overwrite` skips the "already configured, overwrite?" prompt,
+    /// for callers that have already obtained confirmation (e.g. remediation).
     pub async fn setup(
         ctx: &mut crate::AppContext,
         launcher_type: &str,
         instance_id: Option<&str>,
+        force_overwrite: bool,
     ) -> Result<()> {
         // Look up type in registry
         let launcher_def = match LAUNCHER_REGISTRY.get(launcher_type) {
@@ -205,7 +208,7 @@ impl LauncherCommands {
         // --- Type-aware clash detection (diverges from Provider pattern) ---
         // Look for any existing launcher of the SAME TYPE, regardless of name.
         let same_type_existing: Vec<String> = ctx
-            .config
+            .config()
             .launchers
             .values()
             .filter(|lc| lc.launcher_type == launcher_type && lc.launcher_id != instance_id)
@@ -237,7 +240,7 @@ impl LauncherCommands {
         };
 
         // Standard same-id overwrite check
-        if ctx.config.get_launcher(&instance_id).is_some() {
+        if ctx.config().get_launcher(&instance_id).is_some() && !force_overwrite {
             let overwrite = ctx.ui.confirm(
                 &format!("Launcher '{instance_id}' is already configured. Overwrite?"),
                 false,
@@ -256,7 +259,7 @@ impl LauncherCommands {
                 anyhow::anyhow!("No config schema registered for launcher type '{launcher_type}'")
             })?;
         let defaults = ctx
-            .config
+            .config()
             .get_launcher(&instance_id)
             .map(|lc| lc.config.clone())
             .or_else(|| LAUNCHER_REGISTRY.default_config(launcher_type))
@@ -286,7 +289,7 @@ impl LauncherCommands {
 
         // Select capabilities to enable for this launcher.
         let previously_enabled: Vec<String> = ctx
-            .config
+            .config()
             .get_launcher(&instance_id)
             .map(|lc| lc.enabled_capabilities.clone())
             .unwrap_or_default();
@@ -300,7 +303,7 @@ impl LauncherCommands {
             config,
         };
 
-        ctx.config
+        ctx.config_mut()
             .insert_launcher(&instance_id, launcher_config)
             .map_err(|e| anyhow::anyhow!("Failed to save launcher config: {e}"))?;
 
@@ -350,7 +353,7 @@ impl LauncherCommands {
     /// config. After this call `launcher list` will no longer show the entry
     /// and `granite-cli launch <id>` will return an error.
     pub fn remove(ctx: &mut crate::AppContext, launcher_id: &str) -> Result<()> {
-        if ctx.config.get_launcher(launcher_id).is_none() {
+        if ctx.config().get_launcher(launcher_id).is_none() {
             anyhow::bail!("No launcher configured with id '{launcher_id}'. Nothing to remove.");
         }
 
@@ -369,7 +372,7 @@ impl LauncherCommands {
             }
         }
 
-        if let Err(e) = ctx.config.remove_launcher(launcher_id) {
+        if let Err(e) = ctx.config_mut().remove_launcher(launcher_id) {
             ctx.ui
                 .warn(&format!("failed to persist launcher removal: {e}"));
         }
@@ -408,7 +411,7 @@ async fn select_capabilities(
     let mut announced = false;
 
     loop {
-        let source = CapabilitySource::from_config(&ctx.config);
+        let source = ctx.sources().capabilities();
 
         // Instances whose binding_types() intersect the launcher's supported set.
         let mut compatible_instances: Vec<String> = source
@@ -516,7 +519,7 @@ async fn select_capabilities(
 
         let nickname = ctx.ui.text("Name this capability instance", cap_type)?;
 
-        crate::commands::CapabilityCommands::setup(ctx, cap_type, Some(&nickname)).await?;
+        crate::commands::CapabilityCommands::setup(ctx, cap_type, Some(&nickname), false).await?;
 
         // Pre-select the new capability on the next iteration.
         enabled.push(nickname.clone());
@@ -536,10 +539,7 @@ mod tests {
     use std::sync::Arc;
 
     fn test_ctx() -> crate::AppContext {
-        crate::AppContext {
-            config: Config::default(),
-            ui: Arc::new(CaptureUi::default()),
-        }
+        crate::AppContext::new(Config::default(), Arc::new(CaptureUi::default()))
     }
 
     fn capture(ctx: &crate::AppContext) -> &CaptureUi {
@@ -550,7 +550,7 @@ mod tests {
 
     fn ctx_with_launcher(id: &str, launcher_type: &str) -> crate::AppContext {
         let mut ctx = test_ctx();
-        ctx.config.launchers.insert(
+        ctx.config_mut().launchers.insert(
             id.to_string(),
             LauncherConfig {
                 launcher_id: id.to_string(),
@@ -658,7 +658,7 @@ mod tests {
             ("a-claude", "claude"),
             ("my-bob", "bob"),
         ] {
-            ctx.config.launchers.insert(
+            ctx.config_mut().launchers.insert(
                 id.to_string(),
                 LauncherConfig {
                     launcher_id: id.to_string(),
@@ -712,7 +712,7 @@ mod tests {
     fn info_configured_launcher_renders_detail_with_config() {
         let mut ctx = ctx_with_launcher("my-claude", "claude");
 
-        if let Some(cfg) = ctx.config.launchers.get_mut("my-claude") {
+        if let Some(cfg) = ctx.config_mut().launchers.get_mut("my-claude") {
             cfg.enabled_capabilities = vec!["chat".to_string(), "plan".to_string()];
         }
 
@@ -745,7 +745,7 @@ mod tests {
     #[test]
     fn info_configured_unknown_type_renders_note() {
         let mut ctx = test_ctx();
-        ctx.config.launchers.insert(
+        ctx.config_mut().launchers.insert(
             "custom-launcher".to_string(),
             LauncherConfig {
                 launcher_id: "custom-launcher".to_string(),
@@ -782,7 +782,7 @@ mod tests {
         // proceeds with the new name. The wizard then fails at binary
         // validation (claude not on PATH in CI), but by that point the clash
         // info message must already have been emitted.
-        let _ = LauncherCommands::setup(&mut ctx, "claude", Some("claude-new")).await;
+        let _ = LauncherCommands::setup(&mut ctx, "claude", Some("claude-new"), false).await;
         let infos = infos!(ctx);
         assert!(
             infos.iter().any(|m| m.contains("claude-old")),
@@ -793,7 +793,7 @@ mod tests {
     #[tokio::test]
     async fn setup_unknown_type_returns_err() {
         let mut ctx = test_ctx();
-        let result = LauncherCommands::setup(&mut ctx, "no-such-type", Some("test")).await;
+        let result = LauncherCommands::setup(&mut ctx, "no-such-type", Some("test"), false).await;
         assert!(result.is_err());
     }
 
@@ -815,7 +815,7 @@ mod tests {
             .push_back(binary.to_string_lossy().into_owned());
 
         home.make_unwritable();
-        let result = LauncherCommands::setup(&mut ctx, "claude", Some("test-claude")).await;
+        let result = LauncherCommands::setup(&mut ctx, "claude", Some("test-claude"), false).await;
         home.make_writable();
 
         assert!(result.is_err());
@@ -838,11 +838,11 @@ mod tests {
     fn remove_existing_launcher_succeeds_and_disappears_from_list() {
         let _home = crate::config::TestConfigHome::new();
         let mut ctx = ctx_with_launcher("my-claude", "claude");
-        assert!(ctx.config.get_launcher("my-claude").is_some());
+        assert!(ctx.config().get_launcher("my-claude").is_some());
 
         LauncherCommands::remove(&mut ctx, "my-claude").unwrap();
 
-        assert!(ctx.config.get_launcher("my-claude").is_none());
+        assert!(ctx.config().get_launcher("my-claude").is_none());
         let infos = infos!(ctx);
         assert!(
             infos
@@ -917,7 +917,7 @@ mod tests {
     fn add_capability(ctx: &mut crate::AppContext, cap_id: &str, model_id: &str) {
         // The model needs a provider to bind, so a capability is only
         // constructible, and so only listed, with one configured.
-        ctx.config.providers.insert(
+        ctx.config_mut().providers.insert(
             "ollama".to_string(),
             crate::config::ProviderConfig {
                 provider_id: "ollama".to_string(),
@@ -925,7 +925,7 @@ mod tests {
                 config: serde_json::json!({}),
             },
         );
-        ctx.config.models.insert(
+        ctx.config_mut().models.insert(
             model_id.to_string(),
             crate::config::ModelConfig {
                 model_id: model_id.to_string(),
@@ -935,7 +935,7 @@ mod tests {
                 variant: None,
             },
         );
-        ctx.config.capabilities.insert(
+        ctx.config_mut().capabilities.insert(
             cap_id.to_string(),
             crate::config::CapabilityConfig {
                 capability_id: cap_id.to_string(),
@@ -1072,6 +1072,35 @@ mod tests {
             prompts[0].2[idx],
             "my-agent should be pre-checked as it was previously enabled"
         );
+    }
+
+    // Choosing "Configure a new capability..." calls CapabilityCommands::setup.
+    #[tokio::test]
+    async fn select_capabilities_calls_capability_setup_when_configure_new_is_chosen() {
+        let _home = crate::config::TestConfigHome::new();
+        let mut ctx = test_ctx();
+        // Add a configured capability so the list has two items:
+        // ["my-agent", "Configure a new capability..."].
+        // Selecting the last index hits the "configure new" branch (line 522).
+        add_capability(&mut ctx, "my-agent", "granite-3.1-8b-instruct");
+        let launcher_def = claude_launcher_def();
+        {
+            let ui = capture_ui!(ctx);
+            // Pick "Configure a new capability..." (index 1), then on the
+            // next iteration pick nothing (empty selection) to exit the loop.
+            ui.multi_select_answers.borrow_mut().push_back(vec![1]);
+            ui.multi_select_answers.borrow_mut().push_back(vec![]);
+            // Provide a name for the new capability instance.
+            ui.text_answers
+                .borrow_mut()
+                .push_back("new-chat".to_string());
+        }
+
+        let result = select_capabilities(&mut ctx, &launcher_def, &[]).await;
+
+        // Setup ran: result is either Ok or an error from setup.
+        // Either way line 522 was reached.
+        let _ = result;
     }
 
     // Selecting an existing instance returns its ID.

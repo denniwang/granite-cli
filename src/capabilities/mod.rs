@@ -5,6 +5,9 @@ use std::sync::LazyLock;
 // Third Party
 use alog::{MessageLevel, alog_channel, use_channel};
 
+// Local
+use crate::sources::SourceError;
+
 use_channel!("CAPBL");
 
 pub static CAPABILITY_REGISTRY: LazyLock<base::CapabilityFactory> = LazyLock::new(|| {
@@ -25,19 +28,24 @@ pub static CAPABILITY_REGISTRY: LazyLock<base::CapabilityFactory> = LazyLock::ne
 /// (`capability_id`) rather than its catalog type (`capability_type`). The
 /// instance is kept, so every later ask for that id returns the same object.
 pub struct CapabilitySource {
-    /// The configuration this source was built from. Only
-    /// `config.capabilities` is read; `construct` takes the whole thing.
-    config: crate::config::Config,
+    /// The settings for this kind, from the configuration snapshot the
+    /// source was built from.
+    configs: HashMap<String, crate::config::CapabilityConfig>,
     /// The collection a capability's model name is resolved against.
     models: std::sync::Arc<crate::models::ModelSource>,
     cache: std::sync::Mutex<HashMap<String, std::sync::Arc<dyn ResolvedCapability>>>,
 }
 
 impl CapabilitySource {
-    pub fn from_config(config: &crate::config::Config) -> Self {
+    /// Capabilities resolved against a model source somebody else built, so
+    /// two capabilities naming one model share the object it resolved to.
+    pub(crate) fn with_models(
+        config: &crate::config::Config,
+        models: std::sync::Arc<crate::models::ModelSource>,
+    ) -> Self {
         Self {
-            config: config.clone(),
-            models: std::sync::Arc::new(crate::models::ModelSource::from_config(config)),
+            configs: config.capabilities.clone(),
+            models,
             cache: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -45,35 +53,50 @@ impl CapabilitySource {
     /// The capability configured under `capability_id`, built on the first
     /// ask and returned from the cache on every one after it. Errors when no
     /// entry is configured under that id, when its `capability_type` is not
-    /// in the registry, or when the names it holds do not resolve.
+    /// in the registry, when its settings are not valid, or when the model it
+    /// names does not resolve or does not meet what its type requires.
     pub fn get(
         &self,
         capability_id: &str,
     ) -> anyhow::Result<std::sync::Arc<dyn ResolvedCapability>> {
+        self.build(capability_id)
+            .map_err(|e| e.about("capability", capability_id))
+    }
+
+    /// The same, as the typed failure the validator turns into a problem it
+    /// reports. The instance stays in the cache, so a command that goes on
+    /// to use it does not build it again.
+    pub(crate) fn build(
+        &self,
+        capability_id: &str,
+    ) -> Result<std::sync::Arc<dyn ResolvedCapability>, SourceError> {
         if let Some(built) = self.cache.lock().unwrap().get(capability_id) {
             return Ok(built.clone());
         }
         let capability_config = self
-            .config
-            .capabilities
+            .configs
             .get(capability_id)
-            .ok_or_else(|| anyhow::anyhow!("capability '{capability_id}' is not configured"))?;
+            .ok_or(SourceError::NotConfigured)?;
 
-        let built = CAPABILITY_REGISTRY
-            .construct(
-                &capability_config.capability_type,
-                &capability_config.capability_id,
-                &capability_config.config,
-            )
-            .map_err(|e| e.about("capability", capability_id))?;
+        let built = CAPABILITY_REGISTRY.construct(
+            &capability_config.capability_type,
+            &capability_config.capability_id,
+            &capability_config.config,
+        )?;
 
         // Wiring the capability to what it names is where a missing or
-        // unsuitable model is reported. Spec 0024 gated this with a
-        // `validate_ref` walk before constructing, because construction could
-        // not report a failure; `resolve_refs` can, with the same outcome.
-        let built = built
-            .resolve_refs(&*self.models)
-            .map_err(|e| anyhow::anyhow!("Skipping capability '{capability_id}': {e}"))?;
+        // unsuitable model is reported. A model that does not meet the
+        // requirement comes back typed, so it is reported with both names.
+        let built =
+            built.resolve_refs(&*self.models).map_err(|e| match e
+                .downcast::<crate::models::UnmetRequirement>()
+            {
+                Ok(unmet) => SourceError::UnmetRequirement {
+                    model_id: unmet.model_id,
+                    unmet: unmet.unmet,
+                },
+                Err(e) => SourceError::Unresolved(e.to_string()),
+            })?;
 
         let built: std::sync::Arc<dyn ResolvedCapability> = std::sync::Arc::from(built);
         // Built outside the lock, so two callers can reach here for one id.
@@ -91,8 +114,7 @@ impl CapabilitySource {
 
 impl crate::dependency::Configured<dyn ResolvedCapability> for CapabilitySource {
     fn instances(&self) -> Vec<(String, std::sync::Arc<dyn ResolvedCapability + 'static>)> {
-        self.config
-            .capabilities
+        self.configs
             .keys()
             .filter_map(|id| match self.get(id) {
                 Ok(capability) => Some((id.clone(), capability)),
@@ -163,8 +185,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn capability_source_constructs_one_instance_per_named_capability() {
+    /// One `agent-model` capability, `chat`, naming a model whose provider is
+    /// configured.
+    fn one_chat_capability() -> Config {
         let mut config = Config::default();
         // The model needs a provider to bind, so the capability is only
         // constructible with one configured.
@@ -191,9 +214,120 @@ mod tests {
             agent_model_config("chat", "granite-3.1-8b-instruct"),
         );
 
+        config
+    }
+
+    impl CapabilitySource {
+        /// Capabilities over a model source of their own, for a test that needs
+        /// no other kind. Commands ask the application context.
+        #[cfg(test)]
+        pub(crate) fn from_config(config: &crate::config::Config) -> Self {
+            Self::with_models(
+                config,
+                std::sync::Arc::new(crate::models::ModelSource::from_config(config)),
+            )
+        }
+    }
+
+    #[test]
+    fn capability_source_constructs_one_instance_per_named_capability() {
+        let config = one_chat_capability();
         let source = CapabilitySource::from_config(&config);
         let ids: Vec<String> = source.instances().into_iter().map(|(id, _)| id).collect();
         assert_eq!(ids, vec!["chat".to_string()]);
+    }
+
+    #[test]
+    fn every_type_reports_an_unmet_requirement_as_one() {
+        // `build` recognises an unmet requirement by downcasting the error
+        // `resolve_refs` returns, which works while each type passes that
+        // error on unchanged. A type that rewraps it as text would have its
+        // mismatch reported as `Unresolved`; this checks every registered
+        // type against a model that supports no functions at all.
+        let mut checked = 0;
+        for (type_name, metadata) in CAPABILITY_REGISTRY.entries() {
+            for dependency in &metadata.dependencies {
+                let Dependency::Model { config_key, .. } = dependency else {
+                    continue;
+                };
+                let mut config = one_chat_capability();
+                config.models.insert(
+                    "bare".to_string(),
+                    ModelConfig {
+                        model_id: "bare".to_string(),
+                        model_type: "custom".to_string(),
+                        config: serde_json::json!({
+                            "family": "Test",
+                            "supported_functions": [],
+                        }),
+                        provider_id: "ollama".to_string(),
+                        variant: None,
+                    },
+                );
+                let mut settings = CAPABILITY_REGISTRY
+                    .default_config(type_name)
+                    .unwrap_or_else(|| serde_json::json!({}));
+                // Defaults can leave required text empty, such as a generic
+                // sub-agent's description and prompt, which would fail
+                // construction before the model is reached.
+                for value in settings
+                    .as_object_mut()
+                    .into_iter()
+                    .flat_map(|o| o.values_mut())
+                {
+                    if value.as_str() == Some("") {
+                        *value = serde_json::json!("set by the test");
+                    }
+                }
+                settings[config_key.as_str()] = serde_json::json!("bare");
+                config.capabilities.insert(
+                    "under-test".to_string(),
+                    CapabilityConfig {
+                        capability_id: "under-test".to_string(),
+                        capability_type: type_name.to_string(),
+                        config: settings,
+                    },
+                );
+
+                // A type whose requirement a model with no functions meets
+                // has nothing to report.
+                let Err(error) = CapabilitySource::from_config(&config).build("under-test") else {
+                    continue;
+                };
+                assert!(
+                    matches!(error, SourceError::UnmetRequirement { ref model_id, .. } if model_id == "bare"),
+                    "'{type_name}' reported {error:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "no capability type declares a model requirement"
+        );
+    }
+
+    #[test]
+    fn the_capability_the_check_built_is_the_one_a_command_gets() {
+        use crate::config::validation::{RefKind, validate_ref};
+
+        let config = one_chat_capability();
+        let sources = crate::sources::Sources::build(&config, None);
+
+        validate_ref(RefKind::Capability, "chat", &config, &sources).unwrap();
+
+        let capabilities = sources.capabilities();
+        let cached = capabilities
+            .cache
+            .lock()
+            .unwrap()
+            .get("chat")
+            .cloned()
+            .expect("the check left the capability in the cache");
+        assert!(std::sync::Arc::ptr_eq(
+            &cached,
+            &capabilities.get("chat").unwrap()
+        ));
     }
 
     /// Records the id it was asked for and refuses it, so a test can see

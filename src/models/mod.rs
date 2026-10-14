@@ -28,31 +28,23 @@ pub static MODEL_REGISTRY: LazyLock<base::ModelFactory> = LazyLock::new(|| {
 /// more than once. The instance is kept, so every later ask for that id
 /// returns the same object.
 pub struct ModelSource {
-    /// The configuration this source was built from. Only `config.models`
-    /// is read; `construct` takes the whole thing.
-    config: crate::config::Config,
+    /// The settings for this kind, from the configuration snapshot the
+    /// source was built from.
+    configs: HashMap<String, crate::config::ModelConfig>,
     providers: Arc<crate::providers::ProviderSource>,
     cache: std::sync::Mutex<HashMap<String, Arc<dyn Model>>>,
 }
 
 impl ModelSource {
-    /// Models whose providers carry their real connection details.
-    pub fn from_config(config: &crate::config::Config) -> Self {
-        Self::with_proxy(config, None)
-    }
-
-    /// Models whose providers point at `model_proxy` when a launch started
-    /// one, so a capability resolved against this source binds to the proxy.
-    pub fn with_proxy(
+    /// Models resolved against a provider source somebody else built, so
+    /// one snapshot has one provider per configured id however it is reached.
+    pub(crate) fn with_providers(
         config: &crate::config::Config,
-        model_proxy: Option<crate::proxy::ProxyHandle>,
+        providers: Arc<crate::providers::ProviderSource>,
     ) -> Self {
         Self {
-            config: config.clone(),
-            providers: Arc::new(crate::providers::ProviderSource::with_proxy(
-                config,
-                model_proxy,
-            )),
+            configs: config.models.clone(),
+            providers,
             cache: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -66,8 +58,7 @@ impl ModelSource {
         model_id: &str,
     ) -> anyhow::Result<Arc<dyn crate::providers::Provider>> {
         let model_config = self
-            .config
-            .models
+            .configs
             .get(model_id)
             .ok_or_else(|| anyhow::anyhow!("model '{model_id}' is not configured"))?;
         self.providers.get(&model_config.provider_id).map_err(|_| {
@@ -86,8 +77,7 @@ impl ModelSource {
         model_id: &str,
     ) -> anyhow::Result<Arc<dyn crate::providers::Provider>> {
         let model_config = self
-            .config
-            .models
+            .configs
             .get(model_id)
             .ok_or_else(|| anyhow::anyhow!("model '{model_id}' is not configured"))?;
         self.providers
@@ -103,10 +93,7 @@ impl ModelSource {
     /// The `"format/precision"` string the model configured under `model_id`
     /// was pinned to, if any.
     pub fn configured_variant(&self, model_id: &str) -> Option<String> {
-        self.config
-            .models
-            .get(model_id)
-            .and_then(|mc| mc.variant.clone())
+        self.configs.get(model_id).and_then(|mc| mc.variant.clone())
     }
 
     /// The model configured under `model_id` (the instance id -- matches
@@ -116,22 +103,29 @@ impl ModelSource {
     /// share one object. Errors when no entry is configured under that id, or
     /// when its `model_type` is not in the registry.
     pub fn get(&self, model_id: &str) -> anyhow::Result<Arc<dyn Model>> {
+        self.build(model_id).map_err(|e| e.about("model", model_id))
+    }
+
+    /// The same, as the typed failure the validator turns into a problem it
+    /// reports. The instance stays in the cache, so a command that goes on
+    /// to use it does not build it again.
+    pub(crate) fn build(
+        &self,
+        model_id: &str,
+    ) -> Result<Arc<dyn Model>, crate::sources::SourceError> {
         if let Some(built) = self.cache.lock().unwrap().get(model_id) {
             return Ok(built.clone());
         }
         let model_config = self
-            .config
-            .models
+            .configs
             .get(model_id)
-            .ok_or_else(|| anyhow::anyhow!("model '{model_id}' is not configured"))?;
+            .ok_or(crate::sources::SourceError::NotConfigured)?;
 
-        let built = MODEL_REGISTRY
-            .construct(
-                &model_config.model_type,
-                &model_config.model_id,
-                &model_config.config,
-            )
-            .map_err(|e| e.about("model", model_id))?;
+        let built = MODEL_REGISTRY.construct(
+            &model_config.model_type,
+            &model_config.model_id,
+            &model_config.config,
+        )?;
 
         let built: Arc<dyn Model> = Arc::from(built);
         // Built outside the lock, so two callers can reach here for one id.
@@ -156,11 +150,13 @@ impl base::ModelLookup for ModelSource {
         let model = self.get(model_id)?;
         if let Some(requirement) = requirement {
             use crate::dependency::Requirement;
-            anyhow::ensure!(
-                requirement.admits_instance(&*model),
-                "model '{model_id}' does not satisfy what this capability requires of it: {}",
-                describe_unmet(requirement, &*model)
-            );
+            if !requirement.admits_instance(&*model) {
+                return Err(UnmetRequirement {
+                    model_id: model_id.to_string(),
+                    unmet: describe_unmet(requirement, &*model),
+                }
+                .into());
+            }
         }
         Ok(ConfiguredModel::new(
             model,
@@ -169,6 +165,27 @@ impl base::ModelLookup for ModelSource {
         ))
     }
 }
+
+/// A model that resolves and does not meet what the capability asking for it
+/// requires. Typed, so the capability source can tell this failure from the
+/// others `resolve_refs` can return and report it with both names.
+#[derive(Debug)]
+pub(crate) struct UnmetRequirement {
+    pub(crate) model_id: String,
+    pub(crate) unmet: String,
+}
+
+impl std::fmt::Display for UnmetRequirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "model '{}' does not satisfy what this capability requires of it: {}",
+            self.model_id, self.unmet
+        )
+    }
+}
+
+impl std::error::Error for UnmetRequirement {}
 
 /// The parts of `requirement` this model does not meet, for an error that
 /// says which one failed rather than that one did.
@@ -216,8 +233,7 @@ fn describe_unmet(
 
 impl crate::dependency::Configured<dyn Model> for ModelSource {
     fn instances(&self) -> Vec<(String, Arc<dyn Model + 'static>)> {
-        self.config
-            .models
+        self.configs
             .keys()
             .filter_map(|id| match self.get(id) {
                 Ok(model) => Some((id.clone(), model)),
@@ -268,6 +284,18 @@ mod tests {
         let mut ids: Vec<String> = source.cache.lock().unwrap().keys().cloned().collect();
         ids.sort();
         ids
+    }
+
+    impl ModelSource {
+        /// Models over a provider source of their own, for a test that needs no
+        /// other kind. Commands ask the application context, whose sources share
+        /// one provider per configured id.
+        pub(crate) fn from_config(config: &crate::config::Config) -> Self {
+            Self::with_providers(
+                config,
+                Arc::new(crate::providers::ProviderSource::from_config(config)),
+            )
+        }
     }
 
     #[test]
@@ -579,7 +607,13 @@ mod tests {
         );
         let server = ProxyServer::start().unwrap();
 
-        let source = ModelSource::with_proxy(&config, Some(server.handle.clone()));
+        let source = ModelSource::with_providers(
+            &config,
+            Arc::new(crate::providers::ProviderSource::with_proxy(
+                &config,
+                Some(server.handle.clone()),
+            )),
+        );
 
         // Registering the route is the launch path's job, so do here what
         // `register_proxy_routes` does there: read the real upstream details

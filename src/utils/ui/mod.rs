@@ -1,6 +1,7 @@
 pub mod app;
 pub mod backends;
 pub mod base;
+pub(crate) mod hints;
 pub mod prompt;
 pub mod setup_pane;
 pub mod tui;

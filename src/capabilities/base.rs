@@ -2,7 +2,7 @@ use crate::capabilities::requirement::{
     ModelRequirement, ProviderRequirement, ShellCommandRequirement,
 };
 use crate::providers::ApiType;
-use crate::registry::{ConfigConstructable, Secret};
+use crate::registry::{ConfigConstructable, ConstructError, Secret};
 use crate::utils::Searchable;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,43 @@ use std::collections::{HashMap, HashSet};
 // Canonical launch-time types live in `launchers::base` -- re-exported here so
 // capabilities and launchers share one `LaunchContext`/`EnvBinding` pair.
 pub use crate::launchers::{EnvBinding, LaunchContext};
+
+/*-- invalid settings ---------------------------------------------------------*/
+
+/// What a capability's config type says is wrong with its settings, as one
+/// line.
+///
+/// `serde_valid` renders its report as a JSON document
+/// (`{"errors":[],"properties":{"model_id":{"errors":["..."]}}}`), which is
+/// not what a prompt should put in front of somebody, so the property names
+/// and their messages are flattened into `model_id: the message`.
+pub(crate) fn invalid_settings(errors: &serde_valid::validation::Errors) -> ConstructError {
+    fn messages(node: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+        if let Some(list) = node.get("errors").and_then(|e| e.as_array()) {
+            for message in list.iter().filter_map(|m| m.as_str()) {
+                out.push(if prefix.is_empty() {
+                    message.to_string()
+                } else {
+                    format!("{prefix}: {message}")
+                });
+            }
+        }
+        if let Some(properties) = node.get("properties").and_then(|p| p.as_object()) {
+            for (name, property) in properties {
+                messages(property, name, out);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    if let Ok(report) = serde_json::to_value(errors) {
+        messages(&report, "", &mut out);
+    }
+    if out.is_empty() {
+        out.push(errors.to_string());
+    }
+    ConstructError::settings(out.join("; "))
+}
 
 /*-- BindingType / BindingRequest / Binding -----------------------------------*/
 

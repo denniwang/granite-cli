@@ -15,9 +15,10 @@ use crate::commands::{
     CapabilityCommands, HardwareCommands, LauncherCommands, ModelCommands, ProviderCommands,
 };
 use crate::dependency::Configured;
-use crate::models::MODEL_REGISTRY;
+use crate::models::{MODEL_REGISTRY, ModelMetadata};
 use crate::providers::PROVIDER_REGISTRY;
 use crate::utils::Searchable;
+use crate::utils::ui::hints::{Hint, render_hints};
 use crate::utils::ui::setup_pane::SetupPane;
 use crate::utils::ui::tui::{restore_terminal, setup_terminal};
 use crate::utils::ui::tui_ui::{Answer, OutputLine, TuiUi};
@@ -87,6 +88,28 @@ fn strip_ansi(input: &str) -> String {
         }
     }
     result
+}
+
+/// A Models-section row: a catalog type or a configured instance.
+struct ModelEntry {
+    id: String,
+    /// Registry key setup needs (e.g. `custom`).
+    model_type: String,
+    instance_id: Option<String>,
+    metadata: ModelMetadata,
+}
+
+impl ModelEntry {
+    /// Table row: [id, family, size, context, type].
+    fn row(&self) -> Vec<String> {
+        vec![
+            self.id.clone(),
+            self.metadata.family.clone(),
+            self.metadata.format_size(),
+            self.metadata.context_length.to_string(),
+            self.metadata.model_type.to_string(),
+        ]
+    }
 }
 
 /*-- public --*/
@@ -207,7 +230,7 @@ impl App {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
         let recommend_rows_cache = {
-            let source = crate::providers::ProviderSource::from_config(&ctx.config);
+            let source = ctx.sources().providers();
             let instances = source.instances();
             let providers: Vec<&dyn crate::providers::Provider> =
                 instances.iter().map(|(_, p)| &**p).collect();
@@ -221,10 +244,10 @@ impl App {
             )
         };
         let configured_only = [
-            !ctx.config.models.is_empty(),       // Models
-            !ctx.config.providers.is_empty(),    // Providers
-            !ctx.config.launchers.is_empty(),    // Launchers
-            !ctx.config.capabilities.is_empty(), // Capabilities
+            !ctx.config().models.is_empty(),       // Models
+            !ctx.config().providers.is_empty(),    // Providers
+            !ctx.config().launchers.is_empty(),    // Launchers
+            !ctx.config().capabilities.is_empty(), // Capabilities
         ];
         let sessions = Self::load_sessions();
         let hide_inactive = true;
@@ -333,35 +356,17 @@ impl App {
                         self.mode = AppMode::Detail(id);
                     }
                 }
-                KeyCode::Char('s') => {
-                    if self.section == Section::Sessions {
-                        if self.hide_inactive {
-                            self.hide_inactive = false;
-                            let max = self.row_count().saturating_sub(1);
-                            self.row = self.row.min(max);
-                            self.sync_table_state();
-                        }
-                    } else if let Some(idx) = Self::configured_only_idx(&self.section)
-                        && self.configured_only[idx]
-                    {
-                        self.configured_only[idx] = false;
+                KeyCode::Char('c') => {
+                    if let Some(idx) = Self::configured_only_idx(&self.section) {
+                        self.configured_only[idx] = !self.configured_only[idx];
                         let max = self.row_count().saturating_sub(1);
                         self.row = self.row.min(max);
                         self.sync_table_state();
                     }
                 }
-                KeyCode::Char('h') => {
+                KeyCode::Char('i') => {
                     if self.section == Section::Sessions {
-                        if !self.hide_inactive {
-                            self.hide_inactive = true;
-                            let max = self.row_count().saturating_sub(1);
-                            self.row = self.row.min(max);
-                            self.sync_table_state();
-                        }
-                    } else if let Some(idx) = Self::configured_only_idx(&self.section)
-                        && !self.configured_only[idx]
-                    {
-                        self.configured_only[idx] = true;
+                        self.hide_inactive = !self.hide_inactive;
                         let max = self.row_count().saturating_sub(1);
                         self.row = self.row.min(max);
                         self.sync_table_state();
@@ -429,6 +434,14 @@ impl App {
                             instances,
                             cursor: 0,
                         };
+                    } else if matches!(self.section, Section::Models | Section::Recommend)
+                        && let Some(entry) = self.model_entry(&id)
+                    {
+                        return AppAction::StartSetup(
+                            self.section.clone(),
+                            entry.model_type,
+                            entry.instance_id,
+                        );
                     } else {
                         return AppAction::StartSetup(self.section.clone(), id, None);
                     }
@@ -645,12 +658,65 @@ impl App {
     /// `selected_id` always index the same list as the rendered table.
     fn model_search_rows(&self, query: &str) -> Vec<Vec<String>> {
         let only = self.configured_only[0];
-        let configured_ids: std::collections::HashSet<&str> =
-            self.ctx.config.models.keys().map(|k| k.as_str()).collect();
-        ModelCommands::search_rows(query)
+        let configured_ids: std::collections::HashSet<&str> = self
+            .ctx
+            .config()
+            .models
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        let entries = self
+            .model_entries()
+            .into_iter()
+            .map(|entry| (entry.id, entry.metadata));
+        ModelCommands::search_rows_in(entries, query)
             .into_iter()
             .filter(|r| !only || configured_ids.contains(r[0].as_str()))
             .collect()
+    }
+
+    /// The catalog plus configured model instances that have no catalog row.
+    fn model_entries(&self) -> Vec<ModelEntry> {
+        let config = self.ctx.config();
+        let mut entries: Vec<ModelEntry> = MODEL_REGISTRY
+            .entries()
+            .into_iter()
+            .map(|(id, metadata)| ModelEntry {
+                id: id.to_string(),
+                model_type: config
+                    .get_model(id)
+                    .map_or_else(|| id.to_string(), |mc| mc.model_type.clone()),
+                instance_id: config.get_model(id).map(|_| id.to_string()),
+                metadata,
+            })
+            .collect();
+        let catalog_ids: std::collections::HashSet<String> =
+            entries.iter().map(|entry| entry.id.clone()).collect();
+        entries.extend(
+            self.ctx
+                .sources()
+                .models()
+                .instances()
+                .into_iter()
+                .filter(|(id, _)| !catalog_ids.contains(id))
+                .filter_map(|(id, model)| {
+                    let mc = config.get_model(&id)?;
+                    Some(ModelEntry {
+                        model_type: mc.model_type.clone(),
+                        instance_id: Some(id.clone()),
+                        id,
+                        metadata: model.to_metadata(),
+                    })
+                }),
+        );
+        entries.sort_by(|left, right| left.id.cmp(&right.id));
+        entries
+    }
+
+    fn model_entry(&self, id: &str) -> Option<ModelEntry> {
+        self.model_entries()
+            .into_iter()
+            .find(|entry| entry.id == id)
     }
 
     fn filtered_ids(&self, query: &str) -> Vec<String> {
@@ -675,19 +741,24 @@ impl App {
         let ids: Vec<String> = match self.section {
             Section::Models => {
                 let only = self.configured_only[0];
-                let configured_ids: std::collections::HashSet<&str> =
-                    self.ctx.config.models.keys().map(|k| k.as_str()).collect();
-                ModelCommands::catalog_rows(None)
+                let configured_ids: std::collections::HashSet<&str> = self
+                    .ctx
+                    .config()
+                    .models
+                    .keys()
+                    .map(|k| k.as_str())
+                    .collect();
+                self.model_entries()
                     .into_iter()
-                    .filter(|r| !only || configured_ids.contains(r[0].as_str()))
-                    .map(|r| r[0].clone())
+                    .filter(|entry| !only || configured_ids.contains(entry.id.as_str()))
+                    .map(|entry| entry.id)
                     .collect()
             }
             Section::Providers => {
                 let only = self.configured_only[1];
                 let configured_types: std::collections::HashSet<String> = self
                     .ctx
-                    .config
+                    .config()
                     .providers
                     .values()
                     .map(|c| c.provider_type.clone())
@@ -705,7 +776,7 @@ impl App {
                 let only = self.configured_only[2];
                 let configured_types: std::collections::HashSet<String> = self
                     .ctx
-                    .config
+                    .config()
                     .launchers
                     .values()
                     .map(|c| c.launcher_type.clone())
@@ -723,7 +794,7 @@ impl App {
                 let only = self.configured_only[3];
                 let configured_types: std::collections::HashSet<String> = self
                     .ctx
-                    .config
+                    .config()
                     .capabilities
                     .values()
                     .map(|c| c.capability_type.clone())
@@ -853,9 +924,9 @@ impl App {
                     Section::Models => {
                         let only = self.configured_only[0];
                         if only {
-                            self.ctx.config.models.len()
+                            self.ctx.config().models.len()
                         } else {
-                            MODEL_REGISTRY.entries().len()
+                            self.model_entries().len()
                         }
                     }
                     Section::Providers => {
@@ -863,7 +934,7 @@ impl App {
                         if only {
                             let configured_types: std::collections::HashSet<String> = self
                                 .ctx
-                                .config
+                                .config()
                                 .providers
                                 .values()
                                 .map(|c| c.provider_type.clone())
@@ -882,7 +953,7 @@ impl App {
                         if only {
                             let configured_types: std::collections::HashSet<String> = self
                                 .ctx
-                                .config
+                                .config()
                                 .launchers
                                 .values()
                                 .map(|c| c.launcher_type.clone())
@@ -901,7 +972,7 @@ impl App {
                         if only {
                             let configured_types: std::collections::HashSet<String> = self
                                 .ctx
-                                .config
+                                .config()
                                 .capabilities
                                 .values()
                                 .map(|c| c.capability_type.clone())
@@ -966,8 +1037,13 @@ impl App {
 
         match self.section {
             Section::Models => {
-                let configured_ids: std::collections::HashSet<&str> =
-                    self.ctx.config.models.keys().map(|k| k.as_str()).collect();
+                let configured_ids: std::collections::HashSet<&str> = self
+                    .ctx
+                    .config()
+                    .models
+                    .keys()
+                    .map(|k| k.as_str())
+                    .collect();
 
                 // When a search is active, use search_rows (shows MATCHED ON,
                 // sorted by match priority).  Without a query, use catalog_rows
@@ -986,8 +1062,10 @@ impl App {
                     (rows, h)
                 } else {
                     let filtered_ids = self.filtered_ids(query);
-                    let rows = ModelCommands::catalog_rows(None)
-                        .into_iter()
+                    let rows = self
+                        .model_entries()
+                        .iter()
+                        .map(ModelEntry::row)
                         .filter(|r| filtered_ids.contains(&r[0]))
                         .collect();
                     let h = Row::new(vec!["", "ID", "FAMILY", "SIZE", "TYPE"]).style(
@@ -1058,15 +1136,9 @@ impl App {
                     ]
                 };
 
-                let table = Table::new(rows, widths.to_vec()).header(header).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(if self.configured_only[0] {
-                            " Models [s: show catalog] "
-                        } else {
-                            " Models [h: hide catalog] "
-                        }),
-                );
+                let table = Table::new(rows, widths.to_vec())
+                    .header(header)
+                    .block(Block::default().borders(Borders::ALL).title(" Models "));
 
                 frame.render_stateful_widget(table, table_area, &mut self.table_state);
             }
@@ -1086,7 +1158,7 @@ impl App {
                 // Collect configured types for marker column
                 let configured_types: std::collections::HashSet<String> = self
                     .ctx
-                    .config
+                    .config()
                     .providers
                     .values()
                     .map(|c| c.provider_type.clone())
@@ -1159,15 +1231,9 @@ impl App {
                     ]
                 };
 
-                let table = Table::new(rows, widths.to_vec()).header(header).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(if self.configured_only[1] {
-                            " Providers [s: show catalog] "
-                        } else {
-                            " Providers [h: hide catalog] "
-                        }),
-                );
+                let table = Table::new(rows, widths.to_vec())
+                    .header(header)
+                    .block(Block::default().borders(Borders::ALL).title(" Providers "));
 
                 frame.render_stateful_widget(table, table_area, &mut self.table_state);
             }
@@ -1190,7 +1256,7 @@ impl App {
                 // Collect configured types for marker column
                 let configured_types: std::collections::HashSet<String> = self
                     .ctx
-                    .config
+                    .config()
                     .launchers
                     .values()
                     .map(|c| c.launcher_type.clone())
@@ -1265,15 +1331,9 @@ impl App {
                     ]
                 };
 
-                let table = Table::new(rows, widths.to_vec()).header(header).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(if self.configured_only[2] {
-                            " Launchers [s: show catalog] "
-                        } else {
-                            " Launchers [h: hide catalog] "
-                        }),
-                );
+                let table = Table::new(rows, widths.to_vec())
+                    .header(header)
+                    .block(Block::default().borders(Borders::ALL).title(" Launchers "));
 
                 frame.render_stateful_widget(table, table_area, &mut self.table_state);
             }
@@ -1296,7 +1356,7 @@ impl App {
                 // Collect configured types for marker column
                 let configured_types: std::collections::HashSet<String> = self
                     .ctx
-                    .config
+                    .config()
                     .capabilities
                     .values()
                     .map(|c| c.capability_type.clone())
@@ -1372,18 +1432,19 @@ impl App {
                 let table = Table::new(rows, widths.to_vec()).header(header).block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(if self.configured_only[3] {
-                            " Capabilities [s: show catalog] "
-                        } else {
-                            " Capabilities [h: hide catalog] "
-                        }),
+                        .title(" Capabilities "),
                 );
 
                 frame.render_stateful_widget(table, table_area, &mut self.table_state);
             }
             Section::Recommend => {
-                let configured_ids: std::collections::HashSet<&str> =
-                    self.ctx.config.models.keys().map(|k| k.as_str()).collect();
+                let configured_ids: std::collections::HashSet<&str> = self
+                    .ctx
+                    .config()
+                    .models
+                    .keys()
+                    .map(|k| k.as_str())
+                    .collect();
 
                 // Use filtered_ids so that search_fields (tags, size, variant,
                 // type, providers) are honoured here too, just as in Models/Providers/etc.
@@ -1577,15 +1638,7 @@ impl App {
                     ],
                 )
                 .header(header)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(if self.hide_inactive {
-                            " Sessions [s: show inactive] "
-                        } else {
-                            " Sessions [h: hide inactive] "
-                        }),
-                );
+                .block(Block::default().borders(Borders::ALL).title(" Sessions "));
 
                 frame.render_stateful_widget(table, table_area, &mut self.table_state);
             }
@@ -1856,10 +1909,10 @@ impl App {
         }
 
         let mut lines: Vec<Line> = match self.section {
-            Section::Models | Section::Recommend => match ModelCommands::info_fields(id) {
+            Section::Models | Section::Recommend => match self.model_entry(id) {
                 None => vec![Line::from(format!("Model '{id}' not found."))],
-                Some(fields) => {
-                    let mut lines: Vec<Line> = fields
+                Some(entry) => {
+                    let mut lines: Vec<Line> = ModelCommands::metadata_fields(&entry.metadata)
                         .iter()
                         .map(|(k, v)| {
                             Line::from(vec![
@@ -1869,8 +1922,8 @@ impl App {
                         })
                         .collect();
                     lines.push(Line::from(""));
-                    if let Some(mc) = self.ctx.config.get_model(id) {
-                        let provider_val = match self.ctx.config.get_provider(&mc.provider_id) {
+                    if let Some(mc) = self.ctx.config().get_model(id) {
+                        let provider_val = match self.ctx.config().get_provider(&mc.provider_id) {
                             None => mc.provider_id.clone(),
                             Some(pc) => format!("{} ({})", mc.provider_id, pc.provider_type),
                         };
@@ -1922,7 +1975,7 @@ impl App {
                     endpoints_lines.sort_by(|a, b| a.0.cmp(&b.0));
                     let mut instances: Vec<String> = self
                         .ctx
-                        .config
+                        .config()
                         .providers
                         .iter()
                         .filter(|(_, c)| c.provider_type == id)
@@ -1989,7 +2042,7 @@ impl App {
                 if let Some(l) = crate::launchers::LAUNCHER_REGISTRY.get(id) {
                     let mut configured: Vec<&crate::config::LauncherConfig> = self
                         .ctx
-                        .config
+                        .config()
                         .launchers
                         .values()
                         .filter(|c| c.launcher_type == id)
@@ -2082,7 +2135,7 @@ impl App {
                     };
                     let mut instances: Vec<String> = self
                         .ctx
-                        .config
+                        .config()
                         .capabilities
                         .iter()
                         .filter(|(_, cfg)| cfg.capability_type == id)
@@ -2148,58 +2201,75 @@ impl App {
         frame.render_widget(para, area);
     }
 
+    /// Build the list of [`Hint`]s for the current application state.
+    fn active_hints(&self) -> Vec<Hint> {
+        if self.setup_pane.is_some() {
+            // Setup pane owns its own hints; return empty here — render_footer
+            // calls pane.hint() directly for this case.
+            return vec![];
+        }
+        match &self.mode {
+            AppMode::Browse => {
+                let mut hints = Vec::new();
+                if self.section == Section::Hardware {
+                    hints.push(Hint::Scroll);
+                } else {
+                    hints.push(Hint::Navigate);
+                }
+                hints.push(Hint::Section);
+                if self.section == Section::Sessions {
+                    hints.push(Hint::Open("Detail"));
+                } else if self.section != Section::Hardware {
+                    hints.push(Hint::Open("Detail/Setup"));
+                }
+                if Self::active_search_idx(&self.section).is_some() {
+                    hints.push(Hint::Search);
+                }
+                let filter_active = Self::active_search_idx(&self.section)
+                    .is_some_and(|i| !self.active_search[i].is_empty());
+                if filter_active {
+                    hints.push(Hint::ClearFilter);
+                }
+                if let Some(idx) = Self::configured_only_idx(&self.section) {
+                    hints.push(Hint::ToggleCatalog {
+                        hidden: self.configured_only[idx],
+                    });
+                }
+                if self.section == Section::Sessions {
+                    hints.push(Hint::ToggleInactive {
+                        hidden: self.hide_inactive,
+                    });
+                }
+                hints.push(Hint::Quit);
+                if matches!(
+                    self.section,
+                    Section::Models
+                        | Section::Providers
+                        | Section::Launchers
+                        | Section::Capabilities
+                        | Section::Recommend
+                ) {
+                    hints.push(Hint::ConfiguredLegend);
+                }
+                hints
+            }
+            AppMode::Search(_) => {
+                vec![Hint::Typing("Filter"), Hint::Confirm, Hint::Cancel]
+            }
+            AppMode::Detail(_) => vec![Hint::Scroll, Hint::Open("Setup"), Hint::Back],
+            AppMode::InstancePick { .. } => {
+                vec![Hint::Move, Hint::Open("Select"), Hint::Cancel]
+            }
+        }
+    }
+
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        let hints = if self.setup_pane.is_some() {
-            // Delegate hint rendering to the setup pane.
-            match &self.setup_pane {
-                Some(pane) => pane.hint(),
-                None => "",
-            }
+        let text = if let Some(pane) = &self.setup_pane {
+            pane.hint()
         } else {
-            let filter_active = Self::active_search_idx(&self.section)
-                .is_some_and(|i| !self.active_search[i].is_empty());
-            match &self.mode {
-                AppMode::Browse if self.section == Section::Sessions => {
-                    if self.hide_inactive {
-                        "[↑↓/jk] Navigate  [Tab/⇧Tab] Section  [Enter] Detail  [s] Show inactive  [q] Quit"
-                    } else {
-                        "[↑↓/jk] Navigate  [Tab/⇧Tab] Section  [Enter] Detail  [h] Hide inactive  [q] Quit"
-                    }
-                }
-                AppMode::Browse if self.section == Section::Hardware => {
-                    "[↑↓/jk] Scroll  [Tab/⇧Tab] Section  [q] Quit"
-                }
-                AppMode::Browse if Self::configured_only_idx(&self.section).is_some() => {
-                    let catalog_hidden =
-                        self.configured_only[Self::configured_only_idx(&self.section).unwrap()];
-                    match (catalog_hidden, filter_active) {
-                        (true, false) => {
-                            "[↑↓/jk] Navigate  [Tab/⇧Tab] Section  [Enter] Detail/Setup  [/] Search  [s] Show catalog  [q] Quit  ✓ = configured"
-                        }
-                        (true, true) => {
-                            "[↑↓/jk] Navigate  [Tab/⇧Tab] Section  [Enter] Detail/Setup  [/] Search  [Esc] Clear filter  [s] Show catalog  [q] Quit  ✓ = configured"
-                        }
-                        (false, false) => {
-                            "[↑↓/jk] Navigate  [Tab/⇧Tab] Section  [Enter] Detail/Setup  [/] Search  [h] Hide catalog  [q] Quit  ✓ = configured"
-                        }
-                        (false, true) => {
-                            "[↑↓/jk] Navigate  [Tab/⇧Tab] Section  [Enter] Detail/Setup  [/] Search  [Esc] Clear filter  [h] Hide catalog  [q] Quit  ✓ = configured"
-                        }
-                    }
-                }
-                AppMode::Browse if filter_active => {
-                    // Recommend section: has no catalog toggle but may have an active filter.
-                    "[↑↓/jk] Navigate  [Tab/⇧Tab] Section  [Enter] Detail/Setup  [/] Search  [Esc] Clear filter  [q] Quit  ✓ = configured"
-                }
-                AppMode::Browse => {
-                    "[↑↓/jk] Navigate  [Tab/⇧Tab] Section  [Enter] Detail/Setup  [/] Search  [q] Quit  ✓ = configured"
-                }
-                AppMode::Search(_) => "[typing] Filter  [Enter] Confirm  [Esc] Cancel",
-                AppMode::Detail(_) => "[↑↓/jk] Scroll  [Enter] Setup  [Backspace/Esc/q] Back",
-                AppMode::InstancePick { .. } => "[↑↓/jk] Move  [Enter] Select  [Esc] Cancel",
-            }
+            render_hints(&self.active_hints())
         };
-        let para = Paragraph::new(Span::styled(hints, Style::default().fg(Color::DarkGray)));
+        let para = Paragraph::new(Span::styled(text, Style::default().fg(Color::DarkGray)));
         frame.render_widget(para, area);
     }
 
@@ -2210,7 +2280,7 @@ impl App {
         let mut instances: Vec<String> = match self.section {
             Section::Providers => self
                 .ctx
-                .config
+                .config()
                 .providers
                 .values()
                 .filter(|c| c.provider_type == type_id)
@@ -2218,7 +2288,7 @@ impl App {
                 .collect(),
             Section::Launchers => self
                 .ctx
-                .config
+                .config()
                 .launchers
                 .values()
                 .filter(|c| c.launcher_type == type_id)
@@ -2226,7 +2296,7 @@ impl App {
                 .collect(),
             Section::Capabilities => self
                 .ctx
-                .config
+                .config()
                 .capabilities
                 .values()
                 .filter(|c| c.capability_type == type_id)
@@ -2301,7 +2371,7 @@ pub async fn run_interactive_tui(ctx: crate::AppContext) -> anyhow::Result<()> {
             pane.poll();
             if pane.finished {
                 if let Ok(fresh) = crate::config::Config::new() {
-                    app.ctx.config = fresh;
+                    app.ctx.set_config(fresh);
                 }
                 app.setup_pane = None;
             }
@@ -2339,7 +2409,7 @@ pub async fn run_interactive_tui(ctx: crate::AppContext) -> anyhow::Result<()> {
                 pane.handle_key(key);
                 if pane.finished {
                     if let Ok(fresh) = crate::config::Config::new() {
-                        app.ctx.config = fresh;
+                        app.ctx.set_config(fresh);
                     }
                     app.setup_pane = None;
                 }
@@ -2398,10 +2468,7 @@ fn spawn_setup(
         None => format!("{} — {id}", section.label().to_lowercase()),
     };
 
-    let mut task_ctx = crate::AppContext {
-        config: ctx.config.clone(),
-        ui: tui_ui,
-    };
+    let mut task_ctx = crate::AppContext::new(ctx.config().clone(), tui_ui);
 
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Handle::current();
@@ -2409,11 +2476,13 @@ fn spawn_setup(
             let iid = instance_id.as_deref();
             let result = match &section {
                 Section::Models | Section::Recommend => {
-                    ModelCommands::setup(&mut task_ctx, &id, iid).await
+                    ModelCommands::setup(&mut task_ctx, &id, iid, false).await
                 }
-                Section::Providers => ProviderCommands::setup(&mut task_ctx, &id, iid).await,
-                Section::Launchers => LauncherCommands::setup(&mut task_ctx, &id, iid).await,
-                Section::Capabilities => CapabilityCommands::setup(&mut task_ctx, &id, iid).await,
+                Section::Providers => ProviderCommands::setup(&mut task_ctx, &id, iid, false).await,
+                Section::Launchers => LauncherCommands::setup(&mut task_ctx, &id, iid, false).await,
+                Section::Capabilities => {
+                    CapabilityCommands::setup(&mut task_ctx, &id, iid, false).await
+                }
                 Section::Hardware => Ok(()),
                 Section::Sessions => Ok(()),
             };
@@ -2422,7 +2491,7 @@ fn spawn_setup(
             }
             // Write config back from the task context so changes persist.
             // (The task_ctx.config was cloned before the task started; the
-            // setup commands call ctx.config.insert_* which already persist
+            // setup commands call ctx.config().insert_* which already persist
             // each entry to disk, so the main ctx just needs a reload.)
         });
     });
@@ -2440,10 +2509,74 @@ mod tests {
     use std::sync::Arc;
 
     fn app() -> App {
-        App::new(crate::AppContext {
-            config: Config::default(),
-            ui: Arc::new(CaptureUi::default()),
-        })
+        App::new(crate::AppContext::new(
+            Config::default(),
+            Arc::new(CaptureUi::default()),
+        ))
+    }
+
+    fn app_with_custom_model() -> App {
+        let mut config = Config::default();
+        config.models.insert(
+            "my-local-model".to_string(),
+            crate::config::ModelConfig {
+                model_id: "my-local-model".to_string(),
+                model_type: "custom".to_string(),
+                provider_id: "local-openai".to_string(),
+                variant: None,
+                config: serde_json::json!({ "family": "My Local Model" }),
+            },
+        );
+        App::new(crate::AppContext::new(
+            config,
+            Arc::new(CaptureUi::default()),
+        ))
+    }
+
+    #[test]
+    fn model_entries_merge_catalog_and_custom_instances() {
+        let entries = app_with_custom_model().model_entries();
+        let custom = entries.iter().find(|e| e.id == "my-local-model").unwrap();
+        assert_eq!(custom.model_type, "custom");
+        assert_eq!(custom.instance_id.as_deref(), Some("my-local-model"));
+        assert_eq!(custom.metadata.family, "My Local Model");
+        let catalog = entries
+            .iter()
+            .find(|e| e.id == "granite-3.1-8b-instruct")
+            .unwrap();
+        assert_eq!(catalog.model_type, "granite-3.1-8b-instruct");
+        assert_eq!(catalog.instance_id, None);
+    }
+
+    #[test]
+    fn models_search_finds_a_configured_custom_instance() {
+        let rows = app_with_custom_model().model_search_rows("my-local");
+        assert!(rows.iter().any(|row| row[0] == "my-local-model"));
+    }
+
+    #[test]
+    fn models_count_includes_custom_instances() {
+        let mut app = app_with_custom_model();
+        app.configured_only[0] = false;
+        assert_eq!(
+            app.filtered_ids("").len(),
+            MODEL_REGISTRY.entries().len() + 1
+        );
+    }
+
+    #[test]
+    fn detail_enter_on_custom_instance_starts_setup_with_registry_type() {
+        let mut app = app_with_custom_model();
+        app.mode = AppMode::Detail("my-local-model".to_string());
+        let action = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            action,
+            AppAction::StartSetup(
+                Section::Models,
+                "custom".to_string(),
+                Some("my-local-model".to_string())
+            )
+        );
     }
 
     // -- existing Browse tests ------------------------------------------------
@@ -3019,10 +3152,7 @@ mod tests {
             },
         )
         .unwrap();
-        let mut a = App::new(crate::AppContext {
-            config: cfg,
-            ui: Arc::new(CaptureUi::default()),
-        });
+        let mut a = App::new(crate::AppContext::new(cfg, Arc::new(CaptureUi::default())));
         a.section = Section::Providers;
         let ids = a.filtered_ids("");
         a.row = ids.iter().position(|id| id == "ollama").unwrap_or(0);
@@ -3153,14 +3283,14 @@ mod tests {
     }
 
     #[test]
-    fn sessions_hide_inactive_toggle_s_key() {
+    fn sessions_hide_inactive_toggle_i_key() {
         let mut a = app();
         a.section = Section::Sessions;
         assert!(a.hide_inactive, "default is hide_inactive = true");
-        a.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
-        assert!(!a.hide_inactive, "s key shows inactive");
-        a.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
-        assert!(a.hide_inactive, "h key hides inactive");
+        a.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(!a.hide_inactive, "i key shows inactive");
+        a.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(a.hide_inactive, "i key hides inactive");
     }
 
     #[test]
@@ -3863,78 +3993,72 @@ mod tests {
         assert_eq!(action, AppAction::Quit);
     }
 
-    // -- handle_key: Browse s/h toggles ---------------------------------------
+    // -- handle_key: Browse c/i toggles ---------------------------------------
 
     #[test]
-    fn s_key_shows_catalog_when_configured_only_true() {
+    fn c_key_toggles_catalog_on() {
         let mut a = app();
         a.section = Section::Models;
         a.configured_only[0] = true;
-        a.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        a.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
         assert!(!a.configured_only[0]);
     }
 
     #[test]
-    fn s_key_noop_when_configured_only_already_false() {
+    fn c_key_toggles_catalog_off() {
         let mut a = app();
         a.section = Section::Providers;
         a.configured_only[1] = false;
-        a.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
-        assert!(!a.configured_only[1]);
+        a.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(a.configured_only[1]);
     }
 
     #[test]
-    fn h_key_hides_catalog_when_configured_only_false() {
+    fn c_key_toggles_catalog_launchers() {
         let mut a = app();
         a.section = Section::Launchers;
         a.configured_only[2] = false;
-        a.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        a.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
         assert!(a.configured_only[2]);
+        a.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(!a.configured_only[2]);
     }
 
     #[test]
-    fn h_key_noop_when_configured_only_already_true() {
+    fn c_key_toggles_catalog_capabilities() {
         let mut a = app();
         a.section = Section::Capabilities;
         a.configured_only[3] = true;
-        a.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
-        assert!(a.configured_only[3]);
+        a.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(!a.configured_only[3]);
     }
 
     #[test]
-    fn s_key_shows_inactive_sessions() {
+    fn i_key_shows_inactive_sessions() {
         let mut a = app();
         a.section = Section::Sessions;
         a.hide_inactive = true;
-        a.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        a.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
         assert!(!a.hide_inactive);
     }
 
     #[test]
-    fn s_key_sessions_noop_when_already_showing() {
+    fn i_key_hides_inactive_sessions() {
         let mut a = app();
         a.section = Section::Sessions;
         a.hide_inactive = false;
-        a.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
-        assert!(!a.hide_inactive);
-    }
-
-    #[test]
-    fn h_key_hides_inactive_sessions() {
-        let mut a = app();
-        a.section = Section::Sessions;
-        a.hide_inactive = false;
-        a.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        a.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
         assert!(a.hide_inactive);
     }
 
     #[test]
-    fn h_key_sessions_noop_when_already_hiding() {
+    fn i_key_noop_outside_sessions() {
         let mut a = app();
-        a.section = Section::Sessions;
-        a.hide_inactive = true;
-        a.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
-        assert!(a.hide_inactive);
+        a.section = Section::Models;
+        a.configured_only[0] = true;
+        a.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        // i key has no effect outside Sessions
+        assert!(a.configured_only[0]);
     }
 
     // -- handle_key: Search Backspace / Char ----------------------------------
@@ -4508,5 +4632,140 @@ mod tests {
         assert_eq!(a.mode, AppMode::Browse);
         assert_eq!(a.active_search[0], "");
         assert_eq!(a.active_query(), "");
+    }
+
+    // -- active_hints() -------------------------------------------------------
+
+    #[test]
+    fn active_hints_browse_models_no_filter() {
+        let mut a = app();
+        a.section = Section::Models;
+        a.configured_only[0] = false; // catalog visible → hide hint
+        let hints = a.active_hints();
+        assert!(hints.contains(&Hint::Navigate));
+        assert!(hints.contains(&Hint::Section));
+        assert!(hints.contains(&Hint::Open("Detail/Setup")));
+        assert!(hints.contains(&Hint::Search));
+        assert!(hints.contains(&Hint::ToggleCatalog { hidden: false }));
+        assert!(hints.contains(&Hint::Quit));
+        assert!(hints.contains(&Hint::ConfiguredLegend));
+        assert!(!hints.contains(&Hint::ClearFilter));
+    }
+
+    #[test]
+    fn active_hints_browse_catalog_section_hidden_with_filter() {
+        let mut a = app();
+        a.section = Section::Providers;
+        a.configured_only[1] = true; // catalog hidden → show hint
+        a.active_search[1] = "llama".to_string(); // filter active
+        let hints = a.active_hints();
+        assert!(hints.contains(&Hint::ToggleCatalog { hidden: true }));
+        assert!(hints.contains(&Hint::ClearFilter));
+    }
+
+    #[test]
+    fn active_hints_browse_sessions_hide_inactive_true() {
+        let mut a = app();
+        a.section = Section::Sessions;
+        a.hide_inactive = true;
+        let hints = a.active_hints();
+        assert!(hints.contains(&Hint::Navigate));
+        assert!(hints.contains(&Hint::Open("Detail")));
+        assert!(hints.contains(&Hint::ToggleInactive { hidden: true }));
+        assert!(hints.contains(&Hint::Quit));
+        assert!(!hints.contains(&Hint::Search));
+    }
+
+    #[test]
+    fn active_hints_browse_sessions_hide_inactive_false() {
+        let mut a = app();
+        a.section = Section::Sessions;
+        a.hide_inactive = false;
+        let hints = a.active_hints();
+        assert!(hints.contains(&Hint::ToggleInactive { hidden: false }));
+    }
+
+    #[test]
+    fn active_hints_browse_hardware() {
+        let mut a = app();
+        a.section = Section::Hardware;
+        let hints = a.active_hints();
+        assert_eq!(hints, vec![Hint::Scroll, Hint::Section, Hint::Quit]);
+    }
+
+    #[test]
+    fn active_hints_browse_recommend_no_filter() {
+        let mut a = app();
+        a.section = Section::Recommend;
+        let hints = a.active_hints();
+        assert!(hints.contains(&Hint::Navigate));
+        assert!(hints.contains(&Hint::Search));
+        assert!(hints.contains(&Hint::Quit));
+        assert!(!hints.contains(&Hint::ClearFilter));
+        // No catalog toggle for Recommend
+        assert!(
+            !hints
+                .iter()
+                .any(|h| matches!(h, Hint::ToggleCatalog { .. }))
+        );
+    }
+
+    #[test]
+    fn active_hints_browse_recommend_with_filter() {
+        let mut a = app();
+        a.section = Section::Recommend;
+        a.active_search[4] = "granite".to_string();
+        let hints = a.active_hints();
+        assert!(hints.contains(&Hint::ClearFilter));
+    }
+
+    #[test]
+    fn active_hints_search_mode() {
+        let mut a = app();
+        a.mode = AppMode::Search("x".to_string());
+        let hints = a.active_hints();
+        assert_eq!(
+            hints,
+            vec![Hint::Typing("Filter"), Hint::Confirm, Hint::Cancel]
+        );
+    }
+
+    #[test]
+    fn active_hints_detail_mode() {
+        let mut a = app();
+        a.mode = AppMode::Detail("granite-3.3-8b-instruct".to_string());
+        let hints = a.active_hints();
+        assert_eq!(hints, vec![Hint::Scroll, Hint::Open("Setup"), Hint::Back]);
+    }
+
+    #[test]
+    fn active_hints_instance_pick_mode() {
+        let mut a = app();
+        a.mode = AppMode::InstancePick {
+            type_id: "ollama".to_string(),
+            instances: vec!["my-ollama".to_string()],
+            cursor: 0,
+        };
+        let hints = a.active_hints();
+        assert_eq!(hints, vec![Hint::Move, Hint::Open("Select"), Hint::Cancel]);
+    }
+
+    #[test]
+    fn active_hints_returns_empty_when_setup_pane_active() {
+        let mut a = app();
+        // Simulate setup pane by wiring up a real SetupPane
+        use crate::utils::ui::tui_ui::OutputLine;
+        let (_tx, prompt_rx) = std::sync::mpsc::sync_channel(1);
+        let (_answer_tx, _) = std::sync::mpsc::sync_channel::<crate::utils::ui::tui_ui::Answer>(1);
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::<OutputLine>::new()));
+        let pulls = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        a.setup_pane = Some(crate::utils::ui::setup_pane::SetupPane::new(
+            "test".to_string(),
+            output,
+            pulls,
+            prompt_rx,
+            _answer_tx,
+        ));
+        assert!(a.active_hints().is_empty());
     }
 }

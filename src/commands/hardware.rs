@@ -47,10 +47,10 @@ mod tests {
     use std::sync::Arc;
 
     fn ctx() -> crate::AppContext {
-        crate::AppContext {
-            config: crate::config::Config::default(),
-            ui: Arc::new(CaptureUi::default()),
-        }
+        crate::AppContext::new(
+            crate::config::Config::default(),
+            Arc::new(CaptureUi::default()),
+        )
     }
 
     #[test]

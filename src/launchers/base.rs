@@ -192,6 +192,8 @@ pub(crate) async fn run_command(
     // in WSL) fail with os error 193 ("%1 is not a valid Win32 application")
     // when spawned directly. In those cases, fall back to invoking through
     // `cmd.exe /C`, which handles PE format compatibility correctly.
+    let working_dir = ctx.working_dir.clone();
+
     #[cfg(windows)]
     let (binary_fallback, args_fallback, overlay_fallback) =
         (binary.clone(), args.to_vec(), translated_overlay);
@@ -199,21 +201,29 @@ pub(crate) async fn run_command(
     tokio::task::spawn_blocking(move || -> anyhow::Result<std::process::ExitStatus> {
         let mut spawn_cmd = cmd;
 
-        // In WSL, the parent's CWD may be a WSL path that gets translated to
-        // a UNC path for Windows processes. If the binary is on a Windows
-        // drive, set the CWD to that drive's root to avoid the UNC issue.
+        // Always set the subprocess CWD to the caller's working directory so
+        // the launched tool starts in the right place regardless of platform.
+        spawn_cmd.current_dir(&working_dir);
+
+        // In WSL, the parent's CWD is a WSL path that Windows child processes
+        // cannot navigate to (it becomes an unusable UNC path). Override with
+        // the drive root so the PE binary at least starts somewhere valid.
+        // This must only fire under WSL -- on native Windows the working_dir
+        // set above is already a proper Windows path and must not be replaced.
         #[cfg(windows)]
-        if let Some(drive) = binary_fallback.parent().and_then(|p| {
-            p.to_str().and_then(|s| {
-                let chars: Vec<char> = s.chars().collect();
-                if chars.len() >= 2 && chars[1] == ':' {
-                    Some(format!("{}\\", &s[..2]))
-                } else {
-                    None
-                }
-            })
-        }) {
-            spawn_cmd.current_dir(drive);
+        if crate::config::Config::is_wsl() {
+            if let Some(drive) = binary_fallback.parent().and_then(|p| {
+                p.to_str().and_then(|s| {
+                    let chars: Vec<char> = s.chars().collect();
+                    if chars.len() >= 2 && chars[1] == ':' {
+                        Some(format!("{}\\", &s[..2]))
+                    } else {
+                        None
+                    }
+                })
+            }) {
+                spawn_cmd.current_dir(drive);
+            }
         }
 
         let mut child = match spawn_cmd.spawn() {
@@ -303,6 +313,8 @@ pub(crate) async fn run_command_captured(
     // in WSL) fail with os error 193 ("%1 is not a valid Win32 application")
     // when spawned directly. In those cases, fall back to invoking through
     // `cmd.exe /C`, which handles PE format compatibility correctly.
+    let working_dir = ctx.working_dir.clone();
+
     #[cfg(windows)]
     let (binary_fallback, args_fallback, overlay_fallback) =
         (binary.clone(), args.to_vec(), translated_overlay);
@@ -311,21 +323,29 @@ pub(crate) async fn run_command_captured(
         move || -> anyhow::Result<(std::process::ExitStatus, String, String)> {
             let mut spawn_cmd = cmd;
 
-            // In WSL, the parent's CWD may be a WSL path that gets translated to
-            // a UNC path for Windows processes. If the binary is on a Windows
-            // drive, set the CWD to that drive's root to avoid the UNC issue.
+            // Always set the subprocess CWD to the caller's working directory so
+            // the launched tool starts in the right place regardless of platform.
+            spawn_cmd.current_dir(&working_dir);
+
+            // In WSL, the parent's CWD is a WSL path that Windows child processes
+            // cannot navigate to (it becomes an unusable UNC path). Override with
+            // the drive root so the PE binary at least starts somewhere valid.
+            // This must only fire under WSL -- on native Windows the working_dir
+            // set above is already a proper Windows path and must not be replaced.
             #[cfg(windows)]
-            if let Some(drive) = binary_fallback.parent().and_then(|p| {
-                p.to_str().and_then(|s| {
-                    let chars: Vec<char> = s.chars().collect();
-                    if chars.len() >= 2 && chars[1] == ':' {
-                        Some(format!("{}\\", &s[..2]))
-                    } else {
-                        None
-                    }
-                })
-            }) {
-                spawn_cmd.current_dir(drive);
+            if crate::config::Config::is_wsl() {
+                if let Some(drive) = binary_fallback.parent().and_then(|p| {
+                    p.to_str().and_then(|s| {
+                        let chars: Vec<char> = s.chars().collect();
+                        if chars.len() >= 2 && chars[1] == ':' {
+                            Some(format!("{}\\", &s[..2]))
+                        } else {
+                            None
+                        }
+                    })
+                }) {
+                    spawn_cmd.current_dir(drive);
+                }
             }
 
             let output = match spawn_cmd.output() {
@@ -429,6 +449,39 @@ pub struct EnvBinding {
     pub value: String,
 }
 
+/*-- resolve, then bind -------------------------------------------------------*/
+
+/// Resolves every capability a launcher enables, and only then binds them.
+///
+/// The first pass asks the capability source for each id in turn, so a
+/// capability that cannot be built, or whose model does not resolve or does
+/// not meet what it requires, stops the launch with that capability named and
+/// nothing bound. The second pass runs `on_setup` and `bind_capability` over
+/// what resolved, in the order the launcher lists them, which is where a
+/// launch starts changing the launcher.
+///
+/// The resolved capabilities are returned so the caller can keep them alive:
+/// one that owns a process-scoped resource, such as `vision-mcp`'s in-process
+/// MCP server, has to outlive the launched process so `on_shutdown` tears it
+/// down after it exits.
+pub(crate) async fn resolve_and_bind(
+    launcher: &mut dyn Launcher,
+    enabled_capabilities: &[String],
+    capabilities: &crate::capabilities::CapabilitySource,
+) -> anyhow::Result<Vec<std::sync::Arc<dyn crate::capabilities::ResolvedCapability>>> {
+    let mut resolved = Vec::with_capacity(enabled_capabilities.len());
+    for capability_id in enabled_capabilities {
+        resolved.push(capabilities.get(capability_id)?);
+    }
+
+    for capability in &resolved {
+        capability.on_setup().await?;
+        launcher.bind_capability(capability.as_ref()).await?;
+    }
+
+    Ok(resolved)
+}
+
 /*-- private --*/
 
 define_factory!(Launcher, LauncherMetadata, LauncherFactory);
@@ -446,6 +499,8 @@ pub(crate) mod tests {
         /// When `Some`, `validate_command` resolves to this path directly.
         command_path: Option<PathBuf>,
         command_name: String,
+        /// The capability ids `bind_capability` was called with, in order.
+        pub(crate) bound: std::sync::Mutex<Vec<String>>,
     }
 
     impl crate::registry::Named for FakeLauncher {
@@ -471,6 +526,7 @@ pub(crate) mod tests {
                 instance_id: instance_id.to_string(),
                 command_name,
                 command_path,
+                bound: std::sync::Mutex::new(Vec::new()),
             })
         }
     }
@@ -487,9 +543,13 @@ pub(crate) mod tests {
 
         async fn bind_capability(
             &mut self,
-            _capability: &dyn crate::capabilities::ResolvedCapability,
+            capability: &dyn crate::capabilities::ResolvedCapability,
         ) -> anyhow::Result<()> {
-            anyhow::bail!("Capability binding not supported");
+            self.bound
+                .lock()
+                .unwrap()
+                .push(capability.instance_id().to_string());
+            Ok(())
         }
 
         fn validate_command(&self) -> anyhow::Result<PathBuf> {
@@ -658,7 +718,7 @@ pub(crate) mod tests {
         let ui = PlainOutput;
         let ctx = LaunchContext {
             launcher_id: "test".to_string(),
-            working_dir: PathBuf::from("/tmp"),
+            working_dir: std::env::temp_dir(),
             base_env: HashMap::new(),
             dry_run: false,
             usage_tracker: None,
@@ -674,5 +734,82 @@ pub(crate) mod tests {
 
         let status = run_command(binary, &[], &args, &ctx, &ui).await.unwrap();
         assert!(status.success());
+    }
+
+    /// Two capabilities against one configured model, the second of which
+    /// names a model that is not configured when `broken` is true.
+    fn capabilities(broken: bool) -> crate::capabilities::CapabilitySource {
+        use crate::config::{CapabilityConfig, Config, ModelConfig, ProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.insert(
+            "ollama".to_string(),
+            ProviderConfig {
+                provider_id: "ollama".to_string(),
+                provider_type: "ollama".to_string(),
+                config: serde_json::json!({}),
+            },
+        );
+        config.models.insert(
+            "granite-3.1-8b-instruct".to_string(),
+            ModelConfig {
+                model_id: "granite-3.1-8b-instruct".to_string(),
+                model_type: "granite-3.1-8b-instruct".to_string(),
+                provider_id: "ollama".to_string(),
+                variant: None,
+                config: serde_json::json!({}),
+            },
+        );
+        for (id, model_id) in [
+            ("chat", "granite-3.1-8b-instruct"),
+            (
+                "second",
+                if broken {
+                    "gone"
+                } else {
+                    "granite-3.1-8b-instruct"
+                },
+            ),
+        ] {
+            config.capabilities.insert(
+                id.to_string(),
+                CapabilityConfig {
+                    capability_id: id.to_string(),
+                    capability_type: "agent-model".to_string(),
+                    config: serde_json::json!({ "model_id": model_id }),
+                },
+            );
+        }
+        crate::capabilities::CapabilitySource::from_config(&config)
+    }
+
+    #[tokio::test]
+    async fn a_capability_that_does_not_resolve_leaves_nothing_bound() {
+        let mut launcher = FakeLauncher::new("fake", &serde_json::json!({})).unwrap();
+        let enabled = vec!["chat".to_string(), "second".to_string()];
+
+        let err = resolve_and_bind(&mut launcher, &enabled, &capabilities(true))
+            .await
+            .err()
+            .expect("the second capability does not resolve");
+
+        assert!(err.to_string().contains("second"), "got: {err}");
+        assert!(
+            launcher.bound.lock().unwrap().is_empty(),
+            "the first capability resolved, and nothing was bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthy_capabilities_bind_in_the_order_the_launcher_lists_them() {
+        let mut launcher = FakeLauncher::new("fake", &serde_json::json!({})).unwrap();
+        let enabled = vec!["second".to_string(), "chat".to_string()];
+
+        let resolved = resolve_and_bind(&mut launcher, &enabled, &capabilities(false))
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(*launcher.bound.lock().unwrap(), enabled);
     }
 }

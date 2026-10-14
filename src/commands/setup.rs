@@ -104,7 +104,7 @@ impl Discover {
             recommendations,
             all_model_candidates,
             configured_provider_ids: configured_providers,
-            configured_model_ids: ctx.config.models.keys().cloned().collect(),
+            configured_model_ids: ctx.config().models.keys().cloned().collect(),
             configured_launcher_ids: configured_launchers,
             configured_capability_ids: configured_capabilities,
         }
@@ -114,7 +114,7 @@ impl Discover {
 
     async fn discover_providers(ctx: &crate::AppContext) -> (Vec<Recommendation>, Vec<String>) {
         let configured_ids: HashSet<&str> =
-            ctx.config.providers.keys().map(|s| s.as_str()).collect();
+            ctx.config().providers.keys().map(|s| s.as_str()).collect();
         let mut configured: Vec<String> = Vec::new();
         let mut recommendations: Vec<Recommendation> = Vec::new();
 
@@ -178,7 +178,8 @@ impl Discover {
         configured_provider_ids: &[String],
         profile: &HardwareProfile,
     ) -> Vec<Recommendation> {
-        let configured_ids: HashSet<&str> = ctx.config.models.keys().map(|s| s.as_str()).collect();
+        let configured_ids: HashSet<&str> =
+            ctx.config().models.keys().map(|s| s.as_str()).collect();
 
         // Group models by family, keeping each model's real catalog id
         // alongside its metadata.
@@ -245,7 +246,8 @@ impl Discover {
         configured_provider_ids: &[String],
         profile: &HardwareProfile,
     ) -> Vec<Recommendation> {
-        let configured_ids: HashSet<&str> = ctx.config.models.keys().map(|s| s.as_str()).collect();
+        let configured_ids: HashSet<&str> =
+            ctx.config().models.keys().map(|s| s.as_str()).collect();
 
         let mut recommendations: Vec<Recommendation> = MODEL_REGISTRY
             .entries()
@@ -304,7 +306,7 @@ impl Discover {
     ) -> Vec<String> {
         configured_provider_ids
             .iter()
-            .filter_map(|pid| ctx.config.get_provider(pid))
+            .filter_map(|pid| ctx.config().get_provider(pid))
             .filter_map(|pc| {
                 PROVIDER_REGISTRY
                     .construct(&pc.provider_type, &pc.provider_id, &pc.config)
@@ -319,7 +321,7 @@ impl Discover {
 
     async fn discover_launchers(ctx: &crate::AppContext) -> (Vec<Recommendation>, Vec<String>) {
         let configured_ids: HashSet<&str> =
-            ctx.config.launchers.keys().map(|s| s.as_str()).collect();
+            ctx.config().launchers.keys().map(|s| s.as_str()).collect();
         let mut configured: Vec<String> = Vec::new();
         let mut recommendations: Vec<Recommendation> = Vec::new();
 
@@ -370,8 +372,12 @@ impl Discover {
         _model_recs: &[Recommendation],
         _configured_provider_ids: &[String],
     ) -> (Vec<Recommendation>, Vec<String>) {
-        let configured_ids: Vec<&str> =
-            ctx.config.capabilities.keys().map(|s| s.as_str()).collect();
+        let configured_ids: Vec<&str> = ctx
+            .config()
+            .capabilities
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
         let configured: Vec<String> = configured_ids.iter().copied().map(String::from).collect();
 
         let mut recommendations: Vec<Recommendation> = Vec::new();
@@ -825,11 +831,11 @@ fn matching_catalog_ids(m: &recommended_config::StringMatch) -> Vec<String> {
 }
 
 /// Whether the provider `provider_id` can run `variant`. A provider in
-/// `ctx.config.providers` is constructed from its own config. Any other id is
+/// `ctx.config().providers` is constructed from its own config. Any other id is
 /// taken as a provider type found by discovery and constructed with that
 /// type's default config. Same lookup as `candidate_variants`.
 fn provider_can_run(provider_id: &str, variant: &ModelVariant, ctx: &crate::AppContext) -> bool {
-    let provider = match ctx.config.get_provider(provider_id) {
+    let provider = match ctx.config().get_provider(provider_id) {
         Some(pc) => PROVIDER_REGISTRY.construct(&pc.provider_type, &pc.provider_id, &pc.config),
         None => {
             let default_config = PROVIDER_REGISTRY
@@ -893,14 +899,14 @@ fn healthy_provider_types(discovery: &DiscoveryResult) -> Vec<String> {
 /// recommended/auto-detected launcher, for which id IS the type (same
 /// invariant the rest of this file already relies on).
 fn resolved_launcher_type(ctx: &crate::AppContext, launcher_id: &str) -> String {
-    ctx.config
+    ctx.config()
         .get_launcher(launcher_id)
         .map(|l| l.launcher_type.clone())
         .unwrap_or_else(|| launcher_id.to_string())
 }
 
 /// The id `LauncherCommands::setup` just wrote to or updated in
-/// `ctx.config.launchers`, found by diffing against a `before` snapshot
+/// `ctx.config().launchers`, found by diffing against a `before` snapshot
 /// taken just before the call -- necessary because that wizard lets the
 /// user free-type an instance name, so the resulting id isn't known ahead
 /// of time. `None` when nothing changed (the user declined an overwrite
@@ -909,7 +915,7 @@ fn changed_launcher_id(
     before: &std::collections::HashMap<String, crate::config::LauncherConfig>,
     ctx: &crate::AppContext,
 ) -> Option<String> {
-    ctx.config
+    ctx.config()
         .launchers
         .iter()
         .find_map(|(id, cfg)| match before.get(id) {
@@ -920,7 +926,7 @@ fn changed_launcher_id(
 }
 
 /// The id `ProviderCommands::setup` just wrote to or updated in
-/// `ctx.config.providers`, found by diffing against a `before` snapshot
+/// `ctx.config().providers`, found by diffing against a `before` snapshot
 /// taken just before the call -- necessary because that wizard lets the
 /// user free-type an instance name, so the resulting id isn't known ahead
 /// of time. `None` when nothing changed (the user declined an overwrite
@@ -929,7 +935,7 @@ fn changed_provider_id(
     before: &std::collections::HashMap<String, crate::config::ProviderConfig>,
     ctx: &crate::AppContext,
 ) -> Option<String> {
-    ctx.config
+    ctx.config()
         .providers
         .iter()
         .find_map(|(id, cfg)| match before.get(id) {
@@ -940,7 +946,7 @@ fn changed_provider_id(
 }
 
 /// The id `CapabilityCommands::setup` just wrote to or updated in
-/// `ctx.config.capabilities`, found by diffing against a `before` snapshot
+/// `ctx.config().capabilities`, found by diffing against a `before` snapshot
 /// taken just before the call -- necessary because that wizard lets the
 /// user free-type an instance name, so the resulting id isn't known ahead
 /// of time. `None` when nothing changed (the user declined an overwrite
@@ -949,7 +955,7 @@ fn changed_capability_id(
     before: &std::collections::HashMap<String, crate::config::CapabilityConfig>,
     ctx: &crate::AppContext,
 ) -> Option<String> {
-    ctx.config
+    ctx.config()
         .capabilities
         .iter()
         .find_map(|(id, cfg)| match before.get(id) {
@@ -1109,7 +1115,7 @@ fn recommended_models_for_selection(
         let effective_caps = recommended_config::effective_capabilities(
             launcher_type,
             &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
-            &ctx.config.recommended_configs,
+            &ctx.config().recommended_configs,
         );
         for rec_cap in effective_caps {
             if !selected_caps.contains(&rec_cap.capability) {
@@ -1227,7 +1233,7 @@ impl SetupCommands {
         // for one selected launcher doesn't also land on another selected
         // launcher just because both happen to support its binding type.
         // Keys are the RESOLVED type (matching what configure_all's enable-loop
-        // looks up via `ctx.config.get_launcher(launcher_id).map(|l| l.launcher_type)`).
+        // looks up via `ctx.config().get_launcher(launcher_id).map(|l| l.launcher_type)`).
         let recommended_capability_types_by_launcher: HashMap<String, HashSet<String>> =
             selected_launchers
                 .iter()
@@ -1236,7 +1242,7 @@ impl SetupCommands {
                     let types = recommended_config::effective_capabilities(
                         &launcher_type,
                         &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
-                        &ctx.config.recommended_configs,
+                        &ctx.config().recommended_configs,
                     )
                     .into_iter()
                     .map(|c| c.capability)
@@ -1367,9 +1373,9 @@ impl SetupCommands {
     /// Resolves the recommended config of each launcher in `launchers`
     /// against `hardware`, and returns what `run_auto_with_hardware` passes to
     /// `configure_all`. Models are resolved against `healthy_provider_types`
-    /// and the providers already in `ctx.config.providers`. A capability in a
+    /// and the providers already in `ctx.config().providers`. A capability in a
     /// launcher's config is resolved only when the launcher supports one of
-    /// the capability's binding types, and only when `ctx.config.capabilities`
+    /// the capability's binding types, and only when `ctx.config().capabilities`
     /// has no entry with the capability type as its id.
     fn auto_selection(
         ctx: &crate::AppContext,
@@ -1385,7 +1391,7 @@ impl SetupCommands {
         // Configured providers are added here, without a health check.
         let mut provider_ids: Vec<String> = healthy_provider_types.to_vec();
         let mut configured_provider_ids: Vec<String> =
-            ctx.config.providers.keys().cloned().collect();
+            ctx.config().providers.keys().cloned().collect();
         configured_provider_ids.sort();
         for id in configured_provider_ids {
             if !provider_ids.contains(&id) {
@@ -1402,7 +1408,7 @@ impl SetupCommands {
             let effective_caps = recommended_config::effective_capabilities(
                 launcher_type,
                 &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
-                &ctx.config.recommended_configs,
+                &ctx.config().recommended_configs,
             );
             // Recorded before the binding check below: `configure_all`
             // reads it to decide which launchers a capability is
@@ -1440,7 +1446,7 @@ impl SetupCommands {
                 // `configure_all` does not overwrite a configured capability,
                 // so resolving it again would only configure a model that
                 // the capability does not use.
-                if ctx.config.get_capability(&rec_cap.capability).is_some() {
+                if ctx.config().get_capability(&rec_cap.capability).is_some() {
                     continue;
                 }
                 if let Some(resolved) =
@@ -1534,7 +1540,7 @@ impl SetupCommands {
                     recommended_config::effective_capabilities(
                         launcher_type,
                         &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
-                        &ctx.config.recommended_configs,
+                        &ctx.config().recommended_configs,
                     )
                 })
                 .collect();
@@ -1642,8 +1648,8 @@ impl SetupCommands {
             let chosen_type = type_ids[idx].clone();
 
             let before: HashMap<String, crate::config::CapabilityConfig> =
-                ctx.config.capabilities.clone();
-            CapabilityCommands::setup(ctx, &chosen_type, None).await?;
+                ctx.config().capabilities.clone();
+            CapabilityCommands::setup(ctx, &chosen_type, None, false).await?;
             if let Some(new_id) = changed_capability_id(&before, ctx)
                 && !manual.contains(&new_id)
                 && !caps.iter().any(|(id, ..)| id == &new_id)
@@ -1746,8 +1752,8 @@ impl SetupCommands {
             let chosen_type = type_ids[idx].clone();
 
             let before: HashMap<String, crate::config::LauncherConfig> =
-                ctx.config.launchers.clone();
-            LauncherCommands::setup(ctx, &chosen_type, None).await?;
+                ctx.config().launchers.clone();
+            LauncherCommands::setup(ctx, &chosen_type, None, false).await?;
             if let Some(new_id) = changed_launcher_id(&before, ctx)
                 && !manual.contains(&new_id)
                 && !filtered.iter().any(|(id, ..)| id == &new_id)
@@ -1853,8 +1859,8 @@ impl SetupCommands {
             let chosen_type = type_ids[idx].clone();
 
             let before: HashMap<String, crate::config::ProviderConfig> =
-                ctx.config.providers.clone();
-            ProviderCommands::setup(ctx, &chosen_type, None).await?;
+                ctx.config().providers.clone();
+            ProviderCommands::setup(ctx, &chosen_type, None, false).await?;
             if let Some(new_id) = changed_provider_id(&before, ctx)
                 && !manual.contains(&new_id)
                 && !filtered.iter().any(|(id, ..)| id == &new_id)
@@ -1952,7 +1958,7 @@ impl SetupCommands {
         let providers: Vec<Box<dyn Provider>> = selected_providers
             .iter()
             .filter_map(|pid| {
-                if let Some(pc) = ctx.config.get_provider(pid) {
+                if let Some(pc) = ctx.config().get_provider(pid) {
                     PROVIDER_REGISTRY
                         .construct(&pc.provider_type, &pc.provider_id, &pc.config)
                         .ok()
@@ -2051,7 +2057,7 @@ impl SetupCommands {
             for rec_cap in recommended_config::effective_capabilities(
                 launcher_type,
                 &recommended_config::BUILTIN_RECOMMENDED_CONFIGS,
-                &ctx.config.recommended_configs,
+                &ctx.config().recommended_configs,
             ) {
                 if selected_caps.contains(&rec_cap.capability) {
                     for set in rec_cap.models.values() {
@@ -2188,14 +2194,16 @@ impl SetupCommands {
         // NOT be enabled here even if the binding type matches.
         recommended_capability_types_by_launcher: &HashMap<String, HashSet<String>>,
     ) -> Result<()> {
-        let ui = &*ctx.ui;
+        // A handle, not a borrow of `ctx`: writing configuration below takes
+        // `ctx` mutably, and a borrow of its `ui` field would still be live.
+        let ui = std::sync::Arc::clone(&ctx.ui);
 
         // Configure providers first
         for provider_id in selected_providers {
             // An id already configured (e.g. via a previous session or an
             // escape-hatch wizard invoked earlier in this same run) must be
             // left alone rather than clobbered with a freshly-built default.
-            if ctx.config.get_provider(provider_id).is_some() {
+            if ctx.config().get_provider(provider_id).is_some() {
                 continue;
             }
             ui.info(&format!("\nConfiguring provider: {provider_id}..."));
@@ -2210,7 +2218,7 @@ impl SetupCommands {
             };
 
             if ctx
-                .config
+                .config_mut()
                 .insert_provider(provider_id, provider_config)
                 .is_err()
             {
@@ -2225,7 +2233,7 @@ impl SetupCommands {
             // An id already configured (e.g. via a previous session or an
             // escape-hatch wizard invoked earlier in this same run) must be
             // left alone rather than clobbered with a freshly-built default.
-            if ctx.config.get_launcher(launcher_id).is_some() {
+            if ctx.config().get_launcher(launcher_id).is_some() {
                 continue;
             }
             ui.info(&format!("\nConfiguring launcher: {launcher_id}..."));
@@ -2241,7 +2249,7 @@ impl SetupCommands {
             };
 
             if ctx
-                .config
+                .config_mut()
                 .insert_launcher(launcher_id, launcher_config)
                 .is_err()
             {
@@ -2262,7 +2270,7 @@ impl SetupCommands {
             // A model that is already configured (e.g. by a previous session)
             // keeps its provider and variant, as the provider, launcher and
             // capability loops do for their entries.
-            if ctx.config.get_model(model_id).is_some() {
+            if ctx.config().get_model(model_id).is_some() {
                 continue;
             }
             ui.info(&format!("\nConfiguring model: {model_id}..."));
@@ -2303,7 +2311,11 @@ impl SetupCommands {
                 variant,
             };
 
-            if ctx.config.insert_model(model_id, model_config).is_err() {
+            if ctx
+                .config_mut()
+                .insert_model(model_id, model_config)
+                .is_err()
+            {
                 ui.warn(&format!("Failed to save model config for '{model_id}'"));
             }
         }
@@ -2340,7 +2352,7 @@ impl SetupCommands {
             // An id already configured (e.g. via a previous session or an
             // escape-hatch wizard invoked earlier in this same run) must be
             // left alone rather than clobbered with a freshly-built default.
-            if ctx.config.get_capability(cap_type).is_some() {
+            if ctx.config().get_capability(cap_type).is_some() {
                 continue;
             }
             ui.info(&format!("\nConfiguring capability: {cap_type}..."));
@@ -2361,7 +2373,7 @@ impl SetupCommands {
             };
 
             if ctx
-                .config
+                .config_mut()
                 .insert_capability(cap_type, capability_config)
                 .is_err()
             {
@@ -2391,10 +2403,10 @@ impl SetupCommands {
         // curated opinion on it at all. Must run after both loops above,
         // since it needs a live `CapabilitySource` built from the
         // now-populated capability configs.
-        let capability_source = crate::capabilities::CapabilitySource::from_config(&ctx.config);
+        let capability_source = ctx.sources().capabilities();
         for launcher_id in selected_launchers {
             let Some(launcher_type) = ctx
-                .config
+                .config()
                 .get_launcher(launcher_id)
                 .map(|l| l.launcher_type.clone())
             else {
@@ -2424,7 +2436,7 @@ impl SetupCommands {
             enabled.sort();
 
             if ctx
-                .config
+                .config_mut()
                 .update_launcher(launcher_id, |l| l.enabled_capabilities = enabled.clone())
                 .is_err()
             {
@@ -2449,7 +2461,7 @@ impl SetupCommands {
         selected_providers
             .iter()
             .find(|pid| {
-                ctx.config
+                ctx.config()
                     .get_provider(pid)
                     .and_then(|pc| {
                         PROVIDER_REGISTRY
@@ -2616,14 +2628,16 @@ impl SetupCommands {
         selected_models
             .iter()
             .filter_map(|model_id| {
-                ctx.config.get_model(model_id).and_then(|mc| {
-                    ctx.config.get_provider(mc.provider_id.as_str()).map(|pc| {
-                        (
-                            model_id.clone(),
-                            mc.provider_id.clone(),
-                            pc.provider_type.clone(),
-                        )
-                    })
+                ctx.config().get_model(model_id).and_then(|mc| {
+                    ctx.config()
+                        .get_provider(mc.provider_id.as_str())
+                        .map(|pc| {
+                            (
+                                model_id.clone(),
+                                mc.provider_id.clone(),
+                                pc.provider_type.clone(),
+                            )
+                        })
                 })
             })
             .collect()
@@ -2706,10 +2720,7 @@ mod tests {
     use std::sync::Arc;
 
     fn test_ctx() -> crate::AppContext {
-        crate::AppContext {
-            config: Config::default(),
-            ui: Arc::new(CaptureUi::default()),
-        }
+        crate::AppContext::new(Config::default(), Arc::new(CaptureUi::default()))
     }
 
     /// A fixed hardware profile for discovery tests, in place of
@@ -2745,7 +2756,7 @@ mod tests {
         config: serde_json::Value,
     ) -> crate::AppContext {
         let mut ctx = test_ctx();
-        ctx.config.providers.insert(
+        ctx.config_mut().providers.insert(
             id.to_string(),
             ProviderConfig {
                 provider_id: id.to_string(),
@@ -2758,7 +2769,7 @@ mod tests {
 
     fn ctx_with_model(id: &str, provider_id: Option<&str>) -> crate::AppContext {
         let mut ctx = test_ctx();
-        ctx.config.models.insert(
+        ctx.config_mut().models.insert(
             id.to_string(),
             ModelConfig {
                 model_id: id.to_string(),
@@ -2918,7 +2929,7 @@ mod tests {
     #[tokio::test]
     async fn discover_launchers_skips_configured() {
         let mut ctx = test_ctx();
-        ctx.config.launchers.insert(
+        ctx.config_mut().launchers.insert(
             "claude".to_string(),
             crate::config::LauncherConfig {
                 launcher_id: "claude".to_string(),
@@ -3330,10 +3341,7 @@ mod tests {
     #[tokio::test]
     async fn select_variants_auto_selects_when_only_one_candidate_without_prompting() {
         let capture = Arc::new(CaptureUi::default());
-        let mut ctx = crate::AppContext {
-            config: Config::default(),
-            ui: capture.clone(),
-        };
+        let mut ctx = crate::AppContext::new(Config::default(), capture.clone());
 
         // granite-docling-258M-mlx has exactly one (safetensors) variant;
         // openai-compatible's default `can_run_model` accepts any format.
@@ -3387,10 +3395,7 @@ mod tests {
     #[tokio::test]
     async fn select_variants_defaults_to_discoverys_best_variant() {
         let capture = Arc::new(CaptureUi::default());
-        let mut ctx = crate::AppContext {
-            config: Config::default(),
-            ui: capture.clone(),
-        };
+        let mut ctx = crate::AppContext::new(Config::default(), capture.clone());
 
         let md = MODEL_REGISTRY
             .get("granite-vision-4.1-4b")
@@ -3446,10 +3451,7 @@ mod tests {
     #[tokio::test]
     async fn select_models_configure_different_models_surfaces_partial_fit_candidates() {
         let capture = Arc::new(CaptureUi::default());
-        let mut ctx = crate::AppContext {
-            config: Config::default(),
-            ui: capture.clone(),
-        };
+        let mut ctx = crate::AppContext::new(Config::default(), capture.clone());
 
         let discovery = run_discovery(&ctx).await;
         let selected_caps: HashSet<String> = ["agent-model".to_string()].into_iter().collect();
@@ -3514,10 +3516,7 @@ mod tests {
         // -- so the recommended 3b never had a chance to appear as an
         // option at all, even though `recommended_ids` correctly named it.
         let capture = Arc::new(CaptureUi::default());
-        let mut ctx = crate::AppContext {
-            config: Config::default(),
-            ui: capture.clone(),
-        };
+        let mut ctx = crate::AppContext::new(Config::default(), capture.clone());
         let discovery = run_discovery(&ctx).await;
         // vision-mcp is included alongside sub-agent-explore so the
         // top-level list isn't empty even before the fix (its recommended
@@ -3611,7 +3610,7 @@ mod tests {
         .unwrap();
 
         let claude_enabled = &ctx
-            .config
+            .config()
             .get_launcher("claude")
             .unwrap()
             .enabled_capabilities;
@@ -3621,7 +3620,12 @@ mod tests {
             "claude supports the AgentModel binding, so agent-model should be enabled"
         );
 
-        let bob_enabled = &ctx.config.get_launcher("bob").unwrap().enabled_capabilities;
+        let bob_enabled = ctx
+            .config()
+            .get_launcher("bob")
+            .unwrap()
+            .enabled_capabilities
+            .clone();
         assert!(
             bob_enabled.is_empty(),
             "bob only supports the Mcp binding, so agent-model must not be enabled"
@@ -3671,7 +3675,7 @@ mod tests {
         .unwrap();
 
         let goose_enabled = &ctx
-            .config
+            .config()
             .get_launcher("goose")
             .unwrap()
             .enabled_capabilities;
@@ -3682,7 +3686,7 @@ mod tests {
         );
 
         let claude_enabled = &ctx
-            .config
+            .config()
             .get_launcher("claude")
             .unwrap()
             .enabled_capabilities;
@@ -3706,12 +3710,9 @@ mod tests {
         // old no-op.
         let capture = Arc::new(CaptureUi::default());
         capture.confirm_answers.borrow_mut().push_back(true);
-        let mut ctx = crate::AppContext {
-            config: Config::default(),
-            ui: capture.clone(),
-        };
+        let mut ctx = crate::AppContext::new(Config::default(), capture.clone());
 
-        ctx.config.providers.insert(
+        ctx.config_mut().providers.insert(
             "ollama".to_string(),
             ProviderConfig {
                 provider_id: "ollama".to_string(),
@@ -3729,7 +3730,7 @@ mod tests {
             .iter()
             .find(|v| v.format.eq_ignore_ascii_case("ollama"))
             .expect("fixture model should have an Ollama-format variant");
-        ctx.config.models.insert(
+        ctx.config_mut().models.insert(
             model_id.to_string(),
             ModelConfig {
                 model_id: model_id.to_string(),
@@ -3777,10 +3778,7 @@ mod tests {
     #[tokio::test]
     async fn select_launchers_excludes_launchers_without_a_resolved_binary() {
         let capture = Arc::new(CaptureUi::default());
-        let mut ctx = crate::AppContext {
-            config: Config::default(),
-            ui: capture.clone(),
-        };
+        let mut ctx = crate::AppContext::new(Config::default(), capture.clone());
 
         let discovery = DiscoveryResult {
             recommendations: vec![
@@ -3820,7 +3818,7 @@ mod tests {
     #[tokio::test]
     async fn find_compatible_provider_rejects_format_mismatch() {
         let mut ctx = test_ctx();
-        ctx.config.providers.insert(
+        ctx.config_mut().providers.insert(
             "lm-studio".to_string(),
             crate::config::ProviderConfig {
                 provider_id: "lm-studio".to_string(),
@@ -4265,10 +4263,7 @@ mod tests {
         // a launcher's YAML named was pre-selected regardless of whether it
         // could ever resolve.
         let capture = Arc::new(CaptureUi::default());
-        let mut ctx = crate::AppContext {
-            config: Config::default(),
-            ui: capture.clone(),
-        };
+        let mut ctx = crate::AppContext::new(Config::default(), capture.clone());
         let hardware = test_hardware_profile();
 
         // Build a DiscoveryResult by hand (rather than the real
@@ -4349,7 +4344,7 @@ mod tests {
         let mut ctx = test_ctx();
 
         // Configure a launcher instance with a custom id that differs from its type
-        ctx.config.launchers.insert(
+        ctx.config_mut().launchers.insert(
             "claude-work".to_string(),
             crate::config::LauncherConfig {
                 launcher_id: "claude-work".to_string(),
@@ -4420,11 +4415,8 @@ mod tests {
         // helper it depends on works in isolation.
         let _home = crate::config::TestConfigHome::new();
         let capture = Arc::new(CaptureUi::default());
-        let mut ctx = crate::AppContext {
-            config: Config::default(),
-            ui: capture.clone(),
-        };
-        ctx.config.launchers.insert(
+        let mut ctx = crate::AppContext::new(Config::default(), capture.clone());
+        ctx.config_mut().launchers.insert(
             "claude-work".to_string(),
             crate::config::LauncherConfig {
                 launcher_id: "claude-work".to_string(),
@@ -4473,10 +4465,7 @@ mod tests {
         // situation where the escape hatch is most needed. The guard was
         // removed so the loop renders with just the escape-hatch item.
         let capture = Arc::new(CaptureUi::default());
-        let mut ctx = crate::AppContext {
-            config: Config::default(),
-            ui: capture.clone(),
-        };
+        let mut ctx = crate::AppContext::new(Config::default(), capture.clone());
 
         let discovery = DiscoveryResult {
             recommendations: vec![
@@ -4535,7 +4524,7 @@ mod tests {
 
         let custom_url = "http://my-ollama:11434";
         let provider_id = "my-ollama-instance";
-        ctx.config.providers.insert(
+        ctx.config_mut().providers.insert(
             provider_id.to_string(),
             ProviderConfig {
                 provider_id: provider_id.to_string(),
@@ -4561,7 +4550,7 @@ mod tests {
         .unwrap();
 
         let saved = ctx
-            .config
+            .config()
             .get_provider(provider_id)
             .expect("provider must still be in config");
         assert_eq!(
@@ -4585,7 +4574,7 @@ mod tests {
 
         let custom_config_val = "my-custom-launcher-config-value";
         let launcher_id = "my-claude-instance";
-        ctx.config.launchers.insert(
+        ctx.config_mut().launchers.insert(
             launcher_id.to_string(),
             crate::config::LauncherConfig {
                 launcher_id: launcher_id.to_string(),
@@ -4612,7 +4601,7 @@ mod tests {
         .unwrap();
 
         let saved = ctx
-            .config
+            .config()
             .get_launcher(launcher_id)
             .expect("launcher must still be in config");
         assert_eq!(
@@ -4631,7 +4620,7 @@ mod tests {
 
         let custom_config_val = "my-custom-cap-config";
         let cap_id = "my-vision-mcp";
-        ctx.config.capabilities.insert(
+        ctx.config_mut().capabilities.insert(
             cap_id.to_string(),
             crate::config::CapabilityConfig {
                 capability_id: cap_id.to_string(),
@@ -4657,7 +4646,7 @@ mod tests {
         .unwrap();
 
         let saved = ctx
-            .config
+            .config()
             .get_capability(cap_id)
             .expect("capability must still be in config");
         assert_eq!(
@@ -4726,7 +4715,7 @@ mod tests {
         // for opencode lists granite-4.2-8b. The launchers are read in the
         // order given, so claude's model is kept.
         let mut ctx = test_ctx();
-        ctx.config.recommended_configs.insert(
+        ctx.config_mut().recommended_configs.insert(
             "opencode".to_string(),
             recommended_config::RecommendedConfiguration {
                 launcher: "opencode".to_string(),
@@ -4791,7 +4780,7 @@ mod tests {
         .unwrap();
 
         let model_of = |id: &str| {
-            ctx.config
+            ctx.config()
                 .get_capability(id)
                 .unwrap_or_else(|| panic!("{id} should be configured"))
                 .config["model_id"]
@@ -4886,7 +4875,7 @@ mod tests {
         // sub-agent-explore is configured with another model. configure_all
         // keeps that entry, so granite-4.2-3b is not selected for it.
         let mut ctx = test_ctx();
-        ctx.config.capabilities.insert(
+        ctx.config_mut().capabilities.insert(
             "sub-agent-explore".to_string(),
             crate::config::CapabilityConfig {
                 capability_id: "sub-agent-explore".to_string(),
@@ -4916,8 +4905,11 @@ mod tests {
         // configure_all keeps its provider and variant.
         let _home = crate::config::TestConfigHome::new();
         let mut ctx = ctx_with_model("granite-4.2-3b", Some("my-ollama"));
-        ctx.config.models.get_mut("granite-4.2-3b").unwrap().variant =
-            Some("GGUF/Q4_K_M".to_string());
+        ctx.config_mut()
+            .models
+            .get_mut("granite-4.2-3b")
+            .unwrap()
+            .variant = Some("GGUF/Q4_K_M".to_string());
         let discovery = run_discovery(&ctx).await;
 
         SetupCommands::configure_all(
@@ -4935,7 +4927,7 @@ mod tests {
         .unwrap();
 
         let saved = ctx
-            .config
+            .config()
             .get_model("granite-4.2-3b")
             .expect("model must still be configured");
         assert_eq!(saved.provider_id, "my-ollama");
@@ -5023,10 +5015,7 @@ mod tests {
         // was printed twice.
         let _home = crate::config::TestConfigHome::new();
         let capture = Arc::new(CaptureUi::default());
-        let mut ctx = crate::AppContext {
-            config: Config::default(),
-            ui: capture.clone(),
-        };
+        let mut ctx = crate::AppContext::new(Config::default(), capture.clone());
         let discovery = DiscoveryResult {
             recommendations: vec![],
             all_model_candidates: vec![],
@@ -5054,7 +5043,7 @@ mod tests {
             *capture.warns.borrow(),
             vec!["Skipping 'agent-model': no compatible model available.".to_string()]
         );
-        assert!(ctx.config.get_capability("agent-model").is_none());
+        assert!(ctx.config().get_capability("agent-model").is_none());
     }
 
     #[test]
