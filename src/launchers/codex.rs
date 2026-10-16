@@ -149,8 +149,10 @@ impl Launcher for CodexLauncher {
             let binding = capability.bind(request).await?;
             match binding {
                 Binding::SubAgent(binding) => {
-                    self.bound_sub_agents
-                        .push((capability.instance_id().to_string(), binding));
+                    self.bound_sub_agents.push((
+                        capability.instance_id().to_string(),
+                        codex_sub_agent(binding),
+                    ));
                 }
                 other => anyhow::bail!(
                     "expected a SubAgent binding, got {:?}",
@@ -171,7 +173,7 @@ impl Launcher for CodexLauncher {
         let binding = capability.bind(request).await?;
         match binding {
             Binding::AgentModel(binding) => {
-                self.bound_agent_model = Some(binding);
+                self.bound_agent_model = Some(codex_agent_model(binding));
             }
             other => anyhow::bail!(
                 "expected an AgentModel binding, got {:?}",
@@ -786,6 +788,21 @@ fn wire_prefix(endpoint_path: &str) -> &str {
         .unwrap_or("")
 }
 
+/// Codex is the only launcher that uses the OpenAI Responses wire protocol.
+/// Provider bindings normally resolve to Chat Completions, so replace only the
+/// operation path after binding while preserving all provider connection data.
+fn codex_agent_model(mut binding: AgentModelBinding) -> AgentModelBinding {
+    binding.endpoint_path = crate::providers::ApiEndpoint::OpenAIResponses
+        .path()
+        .to_string();
+    binding
+}
+
+fn codex_sub_agent(mut binding: SubAgentBinding) -> SubAgentBinding {
+    binding.model = codex_agent_model(binding.model);
+    binding
+}
+
 /// Returns the API root Codex should call. A session proxy replaces only the
 /// host; the API-version prefix still comes from the resolved provider
 /// endpoint and must be retained for the proxy router to receive `/v1/...`.
@@ -904,6 +921,32 @@ mod tests {
             context_length: Some(131072),
             custom_headers: None,
         }
+    }
+
+    #[test]
+    fn codex_agent_model_uses_the_responses_endpoint() {
+        let mut binding = test_binding();
+        binding.endpoint_path = "/v1/chat/completions".to_string();
+
+        assert_eq!(codex_agent_model(binding).endpoint_path, "/v1/responses");
+    }
+
+    #[test]
+    fn codex_sub_agent_uses_the_responses_endpoint() {
+        let mut model = test_binding();
+        model.endpoint_path = "/v1/chat/completions".to_string();
+        let binding = SubAgentBinding {
+            description: "test".to_string(),
+            prompt: "test".to_string(),
+            tools: vec![],
+            model,
+            known_type: None,
+        };
+
+        assert_eq!(
+            codex_sub_agent(binding).model.endpoint_path,
+            "/v1/responses"
+        );
     }
 
     fn test_launch_context(dry_run: bool) -> LaunchContext {
