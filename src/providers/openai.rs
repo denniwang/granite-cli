@@ -86,23 +86,23 @@ impl OpenAIProvider {
         let mut map = HashMap::new();
         map.insert(
             ModelFunction::Chat,
-            vec![ApiEndpoint::OpenAIResponses, ApiEndpoint::OpenAIChat],
+            vec![ApiEndpoint::OpenAIChat, ApiEndpoint::OpenAIResponses],
         );
         map.insert(
             ModelFunction::ToolCalling,
-            vec![ApiEndpoint::OpenAIResponses, ApiEndpoint::OpenAIChat],
+            vec![ApiEndpoint::OpenAIChat, ApiEndpoint::OpenAIResponses],
         );
         map.insert(
             ModelFunction::Thinking,
-            vec![ApiEndpoint::OpenAIResponses, ApiEndpoint::OpenAIChat],
+            vec![ApiEndpoint::OpenAIChat, ApiEndpoint::OpenAIResponses],
         );
         map.insert(
             ModelFunction::ImageUnderstanding,
-            vec![ApiEndpoint::OpenAIResponses, ApiEndpoint::OpenAIChat],
+            vec![ApiEndpoint::OpenAIChat, ApiEndpoint::OpenAIResponses],
         );
         map.insert(
             ModelFunction::Guardian,
-            vec![ApiEndpoint::OpenAIResponses, ApiEndpoint::OpenAIChat],
+            vec![ApiEndpoint::OpenAIChat, ApiEndpoint::OpenAIResponses],
         );
         map.insert(
             ModelFunction::Embeddings,
@@ -438,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_api_is_first_chat_completions_is_fallback_for_agent_functions() {
+    fn chat_completions_is_first_responses_api_is_fallback_for_agent_functions() {
         use crate::providers::base::ApiEndpoint;
         let provider = OpenAIProvider::new(
             "my-openai",
@@ -455,13 +455,13 @@ mod tests {
             let eps = provider.endpoints_for_function(function);
             assert_eq!(
                 eps.first(),
-                Some(&ApiEndpoint::OpenAIResponses),
-                "{function:?}: expected OpenAIResponses as first endpoint"
+                Some(&ApiEndpoint::OpenAIChat),
+                "{function:?}: expected OpenAIChat as first endpoint"
             );
             assert_eq!(
                 eps.get(1),
-                Some(&ApiEndpoint::OpenAIChat),
-                "{function:?}: expected OpenAIChat as fallback endpoint"
+                Some(&ApiEndpoint::OpenAIResponses),
+                "{function:?}: expected OpenAIResponses as fallback endpoint"
             );
         }
     }
