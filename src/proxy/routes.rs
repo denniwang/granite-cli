@@ -43,6 +43,7 @@ pub(crate) fn register_proxy_routes(
             base_url: provider.base_url().to_string(),
             verify_ssl: provider.verify_ssl(),
             auth: super::UpstreamAuth::Inject(provider.api_key().cloned()),
+            custom_headers: provider.custom_headers().unwrap_or_default(),
         };
         if let Err(e) = handle.register_route(route_key, target, model_id.clone()) {
             ui.warn(&format!(

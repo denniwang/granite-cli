@@ -860,6 +860,7 @@ mod tests {
             .register_route(
                 "granite-3.1-8b-instruct".to_string(),
                 crate::proxy::UpstreamTarget {
+                    custom_headers: std::collections::HashMap::new(),
                     base_url: format!("http://{sub_agent_addr}"),
                     verify_ssl: true,
                     auth: crate::proxy::UpstreamAuth::Inject(Some(crate::registry::Secret(
@@ -874,6 +875,7 @@ mod tests {
             .register_route(
                 "main-model".to_string(),
                 crate::proxy::UpstreamTarget {
+                    custom_headers: std::collections::HashMap::new(),
                     base_url: format!("http://{main_addr}"),
                     verify_ssl: true,
                     auth: crate::proxy::UpstreamAuth::Inject(Some(crate::registry::Secret(

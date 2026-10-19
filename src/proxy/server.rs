@@ -48,6 +48,7 @@ pub struct UpstreamTarget {
     pub base_url: String,
     pub verify_ssl: bool,
     pub auth: UpstreamAuth,
+    pub custom_headers: HashMap<String, Secret>,
 }
 
 /// How the proxy should handle auth headers when forwarding to a target.
@@ -116,6 +117,7 @@ impl ProxyHandle {
             base_url,
             verify_ssl: true,
             auth: UpstreamAuth::Passthrough,
+            custom_headers: HashMap::new(),
         })?;
         let mut table = self.state.routing.write().unwrap();
         table
@@ -193,6 +195,7 @@ impl ProxyServer {
             base_url: ambient_base_url,
             verify_ssl: true,
             auth: UpstreamAuth::Passthrough,
+            custom_headers: HashMap::new(),
         })?;
         let routing = Arc::new(RwLock::new(RoutingTable {
             default,
@@ -231,6 +234,7 @@ impl ProxyServer {
 struct ResolvedTarget {
     base_url: String,
     auth: UpstreamAuth,
+    custom_headers: HashMap<String, Secret>,
     client: reqwest::Client,
 }
 
@@ -239,6 +243,7 @@ impl Clone for ResolvedTarget {
         Self {
             base_url: self.base_url.clone(),
             auth: self.auth.clone(),
+            custom_headers: self.custom_headers.clone(),
             client: self.client.clone(),
         }
     }
@@ -252,6 +257,7 @@ impl ResolvedTarget {
         Ok(Self {
             base_url: target.base_url,
             auth: target.auth,
+            custom_headers: target.custom_headers,
             client,
         })
     }
@@ -425,19 +431,16 @@ fn normalize_agent_messages(body: axum::body::Bytes) -> axum::body::Bytes {
 
     let mut changed = false;
     for item in input {
+        if item.get("type").and_then(serde_json::Value::as_str) != Some("agent_message") {
+            continue;
+        }
         if let Some(content) = item
             .get_mut("content")
             .and_then(serde_json::Value::as_array_mut)
         {
-            let original_len = content.len();
             content.retain(|block| {
                 block.get("type").and_then(serde_json::Value::as_str) != Some("encrypted_content")
             });
-            changed |= content.len() != original_len;
-        }
-
-        if item.get("type").and_then(serde_json::Value::as_str) != Some("agent_message") {
-            continue;
         }
         let content = item
             .get("content")
@@ -516,14 +519,39 @@ async fn forward(
     headers: HeaderMap,
     body: Body,
 ) -> anyhow::Result<Response> {
-    let body_bytes = normalize_agent_messages(axum::body::to_bytes(body, usize::MAX).await?);
+    let body_bytes = axum::body::to_bytes(body, usize::MAX).await?;
+    let is_json = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+        });
+    let body_bytes = if method == Method::POST && uri.path().ends_with("/responses") && is_json {
+        normalize_agent_messages(body_bytes)
+    } else {
+        body_bytes
+    };
     let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    let (target, label, forward_path) = {
+    let (target, label, forward_path, custom_header_names) = {
         let table = state.routing.read().unwrap();
         let content_type = headers
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok());
-        table.target_and_label_for(path_and_query, content_type, &body_bytes)?
+        let (target, label, path) =
+            table.target_and_label_for(path_and_query, content_type, &body_bytes)?;
+        // A child can inherit its parent's provider headers. Strip configured
+        // custom headers before injecting those belonging to the selected route.
+        let names: Vec<String> = table
+            .routes
+            .values()
+            .chain(std::iter::once(&table.default))
+            .flat_map(|target| target.custom_headers.keys())
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        (target, label, path, names)
     };
 
     let url = format!("{}{}", target.base_url.trim_end_matches('/'), forward_path);
@@ -541,7 +569,12 @@ async fn forward(
         if is_hop_by_hop_header(name.as_str()) {
             continue;
         }
-        if strip_client_auth && is_auth_header(name.as_str()) {
+        if strip_client_auth
+            && (is_auth_header(name.as_str())
+                || custom_header_names
+                    .iter()
+                    .any(|custom| custom == name.as_str()))
+        {
             continue;
         }
         if let Ok(v) = value.to_str() {
@@ -553,6 +586,9 @@ async fn forward(
         // schemes a provider might expect -- harmless, since a real
         // upstream only reads the one it understands.
         outbound = outbound.header("x-api-key", &key.0).bearer_auth(&key.0);
+    }
+    for (name, value) in &target.custom_headers {
+        outbound = outbound.header(name, &value.0);
     }
     let upstream_resp = outbound.body(body_bytes).send().await?;
 
@@ -734,6 +770,7 @@ mod tests {
             base_url,
             verify_ssl: true,
             auth,
+            custom_headers: HashMap::new(),
         }
     }
 
@@ -777,6 +814,80 @@ mod tests {
         assert_eq!(body["x_api_key"], "known-key");
 
         server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn custom_headers_follow_selected_provider_without_leaking_parent_headers() {
+        let upstream = SubServer::spawn(
+            Router::new().fallback(any(|headers: HeaderMap| async move {
+                axum::Json(
+                    headers
+                        .iter()
+                        .map(|(name, value)| {
+                            (name.to_string(), value.to_str().unwrap().to_string())
+                        })
+                        .collect::<HashMap<_, _>>(),
+                )
+            })),
+            "header test upstream",
+        )
+        .unwrap();
+        let proxy = ProxyServer::start().unwrap();
+        let base_url = format!("http://{}", upstream.local_addr);
+        proxy
+            .handle
+            .set_default(
+                target(base_url.clone(), UpstreamAuth::Passthrough),
+                "passthrough".into(),
+            )
+            .unwrap();
+        for provider in ["main", "child"] {
+            let mut route = target(
+                base_url.clone(),
+                UpstreamAuth::Inject(Some(Secret(format!("{provider}-key")))),
+            );
+            route.custom_headers = HashMap::from([
+                ("X-Provider".into(), Secret(provider.into())),
+                (format!("X-{provider}-Only"), Secret(provider.into())),
+            ]);
+            proxy
+                .handle
+                .register_route(provider.into(), route, provider.into())
+                .unwrap();
+        }
+
+        let client = reqwest::Client::new();
+        for model in ["main", "child", "unknown"] {
+            let response = client
+                .post(format!("{}/v1/responses", proxy.handle.local_base_url))
+                .header("authorization", "Bearer client-key")
+                .header("X-Provider", "inherited")
+                .header("X-Main-Only", "inherited-main")
+                .header("X-Child-Only", "inherited-child")
+                .header("X-Unrelated", "keep")
+                .json(&serde_json::json!({"model": model}))
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            let headers: HashMap<String, String> = response.json().await.unwrap();
+            assert_eq!(headers["x-unrelated"], "keep");
+            if model == "unknown" {
+                assert_eq!(headers["authorization"], "Bearer client-key");
+                assert_eq!(headers["x-provider"], "inherited");
+                assert_eq!(headers["x-main-only"], "inherited-main");
+                assert_eq!(headers["x-child-only"], "inherited-child");
+            } else {
+                assert_eq!(headers["authorization"], format!("Bearer {model}-key"));
+                assert_eq!(headers["x-api-key"], format!("{model}-key"));
+                assert_eq!(headers["x-provider"], model);
+                assert_eq!(headers[&format!("x-{model}-only")], model);
+                let other = if model == "main" { "child" } else { "main" };
+                assert!(!headers.contains_key(&format!("x-{other}-only")));
+            }
+        }
+        proxy.shutdown().await;
+        upstream.shutdown().await;
     }
 
     /// An upstream that names itself and echoes the model it was asked for,
@@ -1241,6 +1352,83 @@ mod tests {
         assert_eq!(model_from_body(b"not json"), None);
     }
 
+    #[tokio::test]
+    async fn responses_rewrite_is_scoped_to_post_json_and_preserves_other_traffic() {
+        let upstream = SubServer::spawn(
+            Router::new().fallback(any(|body: axum::body::Bytes| async move { body })),
+            "rewrite test upstream",
+        )
+        .unwrap();
+        let proxy = ProxyServer::start().unwrap();
+        proxy
+            .handle
+            .set_default(
+                target(
+                    format!("http://{}", upstream.local_addr),
+                    UpstreamAuth::Passthrough,
+                ),
+                "test".into(),
+            )
+            .unwrap();
+        let body = br#"{"input":[{"type":"agent_message","content":[{"type":"input_text","text":"hello"},{"type":"encrypted_content","data":"opaque"}]},{"type":"message","role":"user","content":[{"type":"encrypted_content","data":"keep"}]}]}"#;
+        let client = reqwest::Client::new();
+        for (method, path, content_type, rewrite) in [
+            (
+                reqwest::Method::POST,
+                "/v1/responses?test=1",
+                "application/json; charset=utf-8",
+                true,
+            ),
+            (
+                reqwest::Method::POST,
+                "/v1/messages",
+                "application/json",
+                false,
+            ),
+            (
+                reqwest::Method::POST,
+                "/v1/chat/completions",
+                "application/json",
+                false,
+            ),
+            (
+                reqwest::Method::GET,
+                "/v1/responses",
+                "application/json",
+                false,
+            ),
+            (
+                reqwest::Method::POST,
+                "/v1/responses",
+                "multipart/form-data; boundary=test",
+                false,
+            ),
+            (reqwest::Method::POST, "/v1/responses", "text/plain", false),
+        ] {
+            let response = client
+                .request(method, format!("{}{path}", proxy.handle.local_base_url))
+                .header("content-type", content_type)
+                .body(body.to_vec())
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            let actual = response.bytes().await.unwrap();
+            if rewrite {
+                let value: serde_json::Value = serde_json::from_slice(&actual).unwrap();
+                assert_eq!(
+                    value["input"][0],
+                    serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]})
+                );
+                assert_eq!(value["input"][1]["content"][0]["data"], "keep");
+            } else {
+                assert_eq!(actual.as_ref(), body, "{path}: {content_type}");
+            }
+        }
+        proxy.shutdown().await;
+        upstream.shutdown().await;
+    }
+
     #[test]
     fn normalize_agent_messages_converts_only_agent_messages_in_responses_input() {
         let normalized = normalize_agent_messages(axum::body::Bytes::from_static(
@@ -1276,7 +1464,7 @@ mod tests {
         );
         assert_eq!(
             value["input"][1]["content"],
-            serde_json::json!([{"type": "input_text", "text": "keep"}])
+            serde_json::json!([{"type": "encrypted_content", "data": "opaque"}, {"type": "input_text", "text": "keep"}])
         );
     }
 

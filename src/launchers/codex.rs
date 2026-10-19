@@ -67,7 +67,7 @@ pub struct CodexLauncherConfig {
     /// ```toml
     /// [launchers.my-codex.extra_providers.local-ollama]
     /// name     = "Local Ollama"
-    /// base_url = "http://localhost:11434"
+    /// base_url = "http://localhost:11434/v1"
     /// wire_api = "responses"
     /// ```
     #[serde(default)]
@@ -243,28 +243,6 @@ impl Launcher for CodexLauncher {
         }
 
         Ok(overlay)
-    }
-
-    /// Maps a canonical `ToolName` onto Codex's own built-in tool-name
-    /// strings. MCP tools use Codex's `<server>.<tool>` dotted convention.
-    fn map_tool_name(&self, tool: &crate::capabilities::ToolName) -> Option<String> {
-        use crate::capabilities::ToolName;
-        Some(match tool {
-            ToolName::FileRead => "read_file".to_string(),
-            ToolName::FileWrite => "write_file".to_string(),
-            ToolName::FileEdit => "apply_patch".to_string(),
-            ToolName::Search => "grep".to_string(),
-            ToolName::FileSearch => "find_files".to_string(),
-            ToolName::Shell => "shell".to_string(),
-            ToolName::WebFetch => "web_fetch".to_string(),
-            ToolName::WebSearch => "web_search".to_string(),
-            ToolName::Mcp { server, tool: None } => format!("{server}.*"),
-            ToolName::Mcp {
-                server,
-                tool: Some(t),
-            } => format!("{server}.{t}"),
-            ToolName::Other(raw) => raw.clone(),
-        })
     }
 
     /// Materializes the granite-cli Codex config directory (pass-through
@@ -535,6 +513,7 @@ impl CodexLauncher {
     /// ```
     fn generate_config_toml(&self, ctx: &LaunchContext) -> anyhow::Result<String> {
         let mut out = String::new();
+        let mut provider_ids = HashSet::new();
 
         if let Some(binding) = &self.bound_agent_model {
             let provider_id = toml_key(&safe_provider_id(&binding.provider_name));
@@ -552,44 +531,15 @@ impl CodexLauncher {
             ));
             out.push('\n');
             out.push_str(&format!("[model_providers.{provider_id}]\n"));
-            out.push_str(&format!(
-                "name     = {}\n",
-                toml_string(&binding.provider_name)
-            ));
-            out.push_str(&format!("base_url = {}\n", toml_string(&base_url)));
-
-            let has_key = binding.api_key.as_ref().is_some_and(|k| !k.0.is_empty());
-            if has_key {
-                out.push_str(&format!("env_key  = {}\n", toml_string(API_KEY_ENV)));
+            provider_ids.insert(safe_provider_id(&binding.provider_name));
+            let mut fields = codex_provider_fields(binding, &base_url, API_KEY_ENV);
+            if let Some(overrides) = &self.config.model_overrides {
+                let overrides = overrides
+                    .as_object()
+                    .context("Codex model_overrides must be an object")?;
+                fields.extend(overrides.clone());
             }
-
-            // Apply model_overrides: any key overrides the value we'd write
-            // for the [model_providers.<id>] table, except `wire_api`: Codex
-            // 0.160+ only accepts its Responses API protocol.
-            if let Some(overrides) = self
-                .config
-                .model_overrides
-                .as_ref()
-                .and_then(serde_json::Value::as_object)
-            {
-                for (key, value) in overrides {
-                    if key == "wire_api" {
-                        if value.as_str() != Some("responses") {
-                            anyhow::bail!(
-                                "Codex requires wire_api = \"responses\"; \"chat\" is unsupported by current Codex versions"
-                            );
-                        }
-                    } else {
-                        out.push_str(&format!(
-                            "{} = {}\n",
-                            toml_key(key),
-                            json_value_to_toml(value)
-                        ));
-                    }
-                }
-            }
-
-            out.push_str("wire_api = \"responses\"\n");
+            write_provider_fields(&mut out, &fields)?;
         }
 
         for (name, binding) in &self.bound_mcp_bindings {
@@ -659,32 +609,15 @@ impl CodexLauncher {
             // provider table for every sub-agent model; a duplicate id is
             // harmless when it denotes the same endpoint and lets several
             // roles share one provider definition.
-            if self.bound_agent_model.as_ref().is_none_or(|main| {
-                safe_provider_id(&main.provider_name)
-                    != safe_provider_id(&binding.model.provider_name)
-            }) && !self.bound_sub_agents[..index].iter().any(|(_, earlier)| {
-                safe_provider_id(&earlier.model.provider_name)
-                    == safe_provider_id(&binding.model.provider_name)
-            }) {
+            if provider_ids.insert(safe_provider_id(&binding.model.provider_name)) {
                 out.push('\n');
                 out.push_str(&format!("[model_providers.{provider_id}]\n"));
-                out.push_str(&format!(
-                    "name     = {}\n",
-                    toml_string(&binding.model.provider_name)
-                ));
-                out.push_str(&format!("base_url = {}\n", toml_string(&base_url)));
-                if binding
-                    .model
-                    .api_key
-                    .as_ref()
-                    .is_some_and(|key| !key.0.is_empty())
-                {
-                    out.push_str(&format!(
-                        "env_key  = {}\n",
-                        toml_string(&sub_agent_api_key_env(&binding.model.provider_name))
-                    ));
-                }
-                out.push_str("wire_api = \"responses\"\n");
+                let fields = codex_provider_fields(
+                    &binding.model,
+                    &base_url,
+                    &sub_agent_api_key_env(&binding.model.provider_name),
+                );
+                write_provider_fields(&mut out, &fields)?;
             }
         }
 
@@ -695,25 +628,22 @@ impl CodexLauncher {
             let mut providers: Vec<_> = self.config.extra_providers.iter().collect();
             providers.sort_by_key(|(id, _)| id.as_str());
             for (id, fields) in providers {
-                if fields
-                    .get("wire_api")
-                    .is_some_and(|value| value.as_str() != Some("responses"))
-                {
-                    anyhow::bail!(
-                        "Codex extra provider '{id}' must use wire_api = \"responses\"; \"chat\" is unsupported by current Codex versions"
-                    );
-                }
                 let safe_id = safe_provider_id(id);
+                anyhow::ensure!(
+                    provider_ids.insert(safe_id.clone()),
+                    "Codex extra provider '{id}' conflicts with provider id '{safe_id}'"
+                );
+                let mut fields = fields
+                    .as_object()
+                    .with_context(|| format!("Codex extra provider '{id}' must be an object"))?
+                    .clone();
+                fields
+                    .entry("wire_api")
+                    .or_insert(serde_json::json!("responses"));
                 out.push('\n');
                 out.push_str(&format!("[model_providers.{}]\n", toml_key(&safe_id)));
-                if let Some(obj) = fields.as_object() {
-                    // Sort fields for deterministic output.
-                    let mut pairs: Vec<_> = obj.iter().collect();
-                    pairs.sort_by_key(|(k, _)| k.as_str());
-                    for (k, v) in pairs {
-                        out.push_str(&format!("{} = {}\n", toml_key(k), json_value_to_toml(v)));
-                    }
-                }
+                write_provider_fields(&mut out, &fields)
+                    .with_context(|| format!("Invalid Codex extra provider '{id}'"))?;
             }
         }
 
@@ -724,13 +654,28 @@ impl CodexLauncher {
     /// registered from the generated root config so this never overwrites or
     /// obscures files in the user's `agents/` directory. Codex's `tools`
     /// field is a structured feature configuration, not a tool-name allow
-    /// list, so roles inherit the session's available tools instead.
+    /// list. Reject read-only tool lists because Codex ignores role-level
+    /// sandbox settings; other roles inherit the session's available tools.
+    /// See https://developers.openai.com/codex/subagents/#approvals-and-sandbox-controls.
     fn generate_sub_agent_files(&self, state_dir: &Path) -> anyhow::Result<Vec<(PathBuf, String)>> {
-        Ok(self
-            .bound_sub_agents
+        self.bound_sub_agents
             .iter()
             .enumerate()
             .map(|(index, (name, binding))| {
+                let can_write = binding.tools.is_empty()
+                    || binding.tools.iter().any(|tool| {
+                        matches!(
+                            tool,
+                            crate::capabilities::ToolName::FileWrite
+                                | crate::capabilities::ToolName::FileEdit
+                        )
+                    });
+                anyhow::ensure!(
+                    can_write,
+                    "Codex cannot enforce the read-only tool list for sub-agent '{name}': \
+                     role-level sandbox_mode is ignored. Use a launcher that supports tool \
+                     restrictions or remove this sub-agent."
+                );
                 let role_name = codex_agent_name(name);
                 let provider_id = safe_provider_id(&binding.model.provider_name);
                 let out = format!(
@@ -741,14 +686,14 @@ impl CodexLauncher {
                     toml_string(&binding.model.model_name),
                     toml_string(&provider_id),
                 );
-                (
+                Ok((
                     state_dir
                         .join(GENERATED_AGENTS_DIR)
                         .join(format!("{index}.toml")),
                     out,
-                )
+                ))
             })
-            .collect())
+            .collect()
     }
 }
 
@@ -881,15 +826,86 @@ fn toml_key(s: &str) -> String {
     }
 }
 
-/// Converts a `serde_json::Value` to a TOML inline scalar.  Only booleans,
-/// numbers, and strings are expected here (override values from user config).
-fn json_value_to_toml(v: &serde_json::Value) -> String {
-    match v {
+/// Provider fields are merged before serialization so overrides cannot create
+/// duplicate TOML keys. Header maps are the only supported non-scalar fields.
+fn codex_provider_fields(
+    binding: &AgentModelBinding,
+    base_url: &str,
+    api_key_env: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::json!({
+        "name": binding.provider_name,
+        "base_url": base_url,
+        "wire_api": "responses",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    if binding
+        .api_key
+        .as_ref()
+        .is_some_and(|key| !key.0.is_empty())
+    {
+        fields.insert("env_key".to_string(), serde_json::json!(api_key_env));
+    }
+    if let Some(headers) = &binding.custom_headers {
+        let headers: serde_json::Map<String, serde_json::Value> = headers
+            .iter()
+            .map(|(name, value)| (name.clone(), serde_json::json!(value.0)))
+            .collect();
+        fields.insert(
+            "http_headers".to_string(),
+            serde_json::Value::Object(headers),
+        );
+    }
+    fields
+}
+
+fn write_provider_fields(
+    out: &mut String,
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        fields.get("wire_api").and_then(serde_json::Value::as_str) == Some("responses"),
+        "Codex requires wire_api = \"responses\"; \"chat\" is unsupported by current Codex versions"
+    );
+    for (key, value) in fields {
+        let value = if matches!(key.as_str(), "http_headers" | "env_http_headers") {
+            let headers = value.as_object().with_context(|| {
+                format!("Codex provider field '{key}' must be a map of strings")
+            })?;
+            let pairs = headers
+                .iter()
+                .map(|(name, value)| {
+                    let value = value.as_str().with_context(|| {
+                        format!("Codex provider field '{key}' requires string header values")
+                    })?;
+                    Ok(format!("{} = {}", toml_key(name), toml_string(value)))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            format!("{{ {} }}", pairs.join(", "))
+        } else {
+            json_value_to_toml(value)
+                .with_context(|| format!("Invalid Codex provider field '{key}'"))?
+        };
+        let padding = match key.as_str() {
+            "name" => "    ",
+            "env_key" => " ",
+            _ => "",
+        };
+        out.push_str(&format!("{}{padding} = {value}\n", toml_key(key)));
+    }
+    Ok(())
+}
+
+/// Reject structured values rather than silently turning them into strings.
+fn json_value_to_toml(v: &serde_json::Value) -> anyhow::Result<String> {
+    Ok(match v {
         serde_json::Value::Bool(b) => b.to_string(),
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::String(s) => toml_string(s),
-        other => toml_string(&other.to_string()),
-    }
+        _ => anyhow::bail!("expected a TOML scalar (boolean, number, or string)"),
+    })
 }
 
 /*-- tests --*/
@@ -920,6 +936,7 @@ mod tests {
             verify_ssl: true,
             context_length: Some(131072),
             custom_headers: None,
+            supported_reasoning_efforts: vec![],
         }
     }
 
@@ -1029,6 +1046,106 @@ mod tests {
     }
 
     // --- generate_config_toml ---
+
+    #[test]
+    fn provider_overrides_replace_generated_values_without_duplicate_keys() {
+        let mut l = launcher_with_model(test_binding());
+        l.config.model_overrides = Some(serde_json::json!({
+            "name": "Overridden", "base_url": "http://override/v1", "env_key": "OTHER_KEY",
+            "request_max_retries": 3, "supports_websockets": false, "wire_api": "responses",
+        }));
+        let config = l.generate_config_toml(&test_launch_context(false)).unwrap();
+        for key in ["name", "base_url", "env_key", "wire_api"] {
+            assert_eq!(
+                config
+                    .lines()
+                    .filter(|line| line.starts_with(&format!("{key} ")))
+                    .count(),
+                1,
+                "{config}"
+            );
+        }
+        assert!(config.contains("name     = \"Overridden\""), "{config}");
+        assert!(
+            config.contains("base_url = \"http://override/v1\""),
+            "{config}"
+        );
+        assert!(config.contains("env_key  = \"OTHER_KEY\""), "{config}");
+        assert!(config.contains("request_max_retries = 3"));
+        assert!(config.contains("supports_websockets = false"));
+    }
+
+    #[test]
+    fn extra_provider_ids_must_be_unique_after_reserved_name_mapping() {
+        let mut l = launcher_with_model(test_binding());
+        l.config
+            .extra_providers
+            .insert("my-openai".into(), serde_json::json!({}));
+        let error = l
+            .generate_config_toml(&test_launch_context(false))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with provider id 'my-openai'")
+        );
+        l.config.extra_providers.clear();
+        l.config
+            .extra_providers
+            .insert("ollama".into(), serde_json::json!({}));
+        l.config
+            .extra_providers
+            .insert("ollama-provider".into(), serde_json::json!({}));
+        let error = l
+            .generate_config_toml(&test_launch_context(false))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with provider id 'ollama-provider'")
+        );
+    }
+
+    #[test]
+    fn provider_fields_reject_non_scalar_values_except_header_maps() {
+        for value in [
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::Value::Null,
+        ] {
+            let mut l = launcher_with_model(test_binding());
+            l.config.model_overrides = Some(serde_json::json!({"name": value}));
+            let error = l
+                .generate_config_toml(&test_launch_context(false))
+                .unwrap_err();
+            assert!(error.to_string().contains("provider field 'name'"));
+        }
+        let mut l = launcher_with_model(test_binding());
+        l.config
+            .extra_providers
+            .insert("invalid".into(), serde_json::json!([]));
+        assert!(
+            l.generate_config_toml(&test_launch_context(false))
+                .unwrap_err()
+                .to_string()
+                .contains("must be an object")
+        );
+    }
+
+    #[test]
+    fn provider_headers_are_written_as_toml_maps() {
+        let mut binding = test_binding();
+        binding.custom_headers = Some(std::collections::HashMap::from([(
+            "X-Custom".into(),
+            crate::registry::Secret::from("value"),
+        )]));
+        let l = launcher_with_model(binding);
+        let config = l.generate_config_toml(&test_launch_context(false)).unwrap();
+        assert!(
+            config.contains("http_headers = { X-Custom = \"value\" }"),
+            "{config}"
+        );
+    }
 
     #[test]
     fn generate_config_toml_sets_model_provider_and_model() {
@@ -1217,7 +1334,7 @@ mod tests {
                 prompt:
                     "Review the code carefully.\n\n=== READ-ONLY MODE ===\nDo not modify files."
                         .to_string(),
-                tools: vec![ToolName::FileRead, ToolName::Search],
+                tools: vec![],
                 model: AgentModelBinding {
                     provider_name: "review-provider".to_string(),
                     model_name: "review-model".to_string(),
@@ -1254,6 +1371,69 @@ mod tests {
                 .contains("developer_instructions = '''Review the code carefully.\n\n=== READ-ONLY MODE ===\nDo not modify files.'''"),
             "multiline instructions must use a TOML multiline literal: {}",
             roles[0].1
+        );
+    }
+
+    #[test]
+    fn sub_agent_tool_lists_cannot_silently_grant_write_access() {
+        let mut l = launcher();
+        l.bound_sub_agents.push((
+            "reviewer".into(),
+            SubAgentBinding {
+                description: "Reviews code".into(),
+                prompt: "Review code".into(),
+                tools: vec![],
+                model: test_binding(),
+                known_type: None,
+            },
+        ));
+        for tools in [
+            vec![ToolName::FileRead, ToolName::Search],
+            vec![ToolName::Shell],
+            vec![ToolName::WebSearch],
+        ] {
+            l.bound_sub_agents[0].1.tools = tools;
+            let error = l.generate_sub_agent_files(Path::new("state")).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot enforce the read-only tool list for sub-agent 'reviewer'"),
+                "{error}"
+            );
+        }
+        for tools in [vec![], vec![ToolName::FileWrite], vec![ToolName::FileEdit]] {
+            l.bound_sub_agents[0].1.tools = tools;
+            let roles = l.generate_sub_agent_files(Path::new("state")).unwrap();
+            assert_eq!(roles.len(), 1);
+            assert!(!roles[0].1.contains("sandbox_mode"));
+        }
+    }
+
+    #[test]
+    fn extra_provider_cannot_duplicate_a_sub_agent_provider() {
+        let mut l = launcher();
+        l.bound_sub_agents.push((
+            "reviewer".into(),
+            SubAgentBinding {
+                description: "Reviews code".into(),
+                prompt: "Review code".into(),
+                tools: vec![],
+                model: test_binding(),
+                known_type: None,
+            },
+        ));
+        l.config.extra_providers.insert(
+            "my-openai".into(),
+            serde_json::json!({"base_url": "http://extra/v1"}),
+        );
+        let error = l
+            .generate_config_toml(&test_launch_context(false))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with provider id 'my-openai'"),
+            "{error}"
         );
     }
 
@@ -1384,57 +1564,6 @@ mod tests {
         );
     }
 
-    // --- map_tool_name ---
-
-    #[test]
-    fn map_tool_name_covers_every_canonical_variant_and_formats_mcp_references() {
-        let l = launcher();
-        assert_eq!(
-            l.map_tool_name(&ToolName::FileRead),
-            Some("read_file".to_string())
-        );
-        assert_eq!(
-            l.map_tool_name(&ToolName::FileWrite),
-            Some("write_file".to_string())
-        );
-        assert_eq!(
-            l.map_tool_name(&ToolName::FileEdit),
-            Some("apply_patch".to_string())
-        );
-        assert_eq!(l.map_tool_name(&ToolName::Search), Some("grep".to_string()));
-        assert_eq!(
-            l.map_tool_name(&ToolName::FileSearch),
-            Some("find_files".to_string())
-        );
-        assert_eq!(l.map_tool_name(&ToolName::Shell), Some("shell".to_string()));
-        assert_eq!(
-            l.map_tool_name(&ToolName::WebFetch),
-            Some("web_fetch".to_string())
-        );
-        assert_eq!(
-            l.map_tool_name(&ToolName::WebSearch),
-            Some("web_search".to_string())
-        );
-        assert_eq!(
-            l.map_tool_name(&ToolName::Mcp {
-                server: "vision".to_string(),
-                tool: None,
-            }),
-            Some("vision.*".to_string())
-        );
-        assert_eq!(
-            l.map_tool_name(&ToolName::Mcp {
-                server: "vision".to_string(),
-                tool: Some("vlm_compare_images".to_string()),
-            }),
-            Some("vision.vlm_compare_images".to_string())
-        );
-        assert_eq!(
-            l.map_tool_name(&ToolName::Other("my_custom_tool".to_string())),
-            Some("my_custom_tool".to_string())
-        );
-    }
-
     // --- bind_capability ---
 
     #[tokio::test]
@@ -1482,6 +1611,7 @@ mod tests {
                         verify_ssl: true,
                         context_length: Some(4096),
                         custom_headers: None,
+                        supported_reasoning_efforts: vec![],
                     },
                     known_type: None,
                 }))
