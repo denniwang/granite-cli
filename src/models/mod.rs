@@ -629,7 +629,6 @@ mod tests {
                     base_url: upstream.base_url().to_string(),
                     verify_ssl: upstream.verify_ssl(),
                     auth: crate::proxy::UpstreamAuth::Inject(upstream.api_key().cloned()),
-                    custom_headers: upstream.custom_headers().unwrap_or_default(),
                 },
                 "granite-3.1-8b-instruct".to_string(),
             )

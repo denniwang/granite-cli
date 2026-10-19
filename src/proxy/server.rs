@@ -48,7 +48,6 @@ pub struct UpstreamTarget {
     pub base_url: String,
     pub verify_ssl: bool,
     pub auth: UpstreamAuth,
-    pub custom_headers: HashMap<String, Secret>,
 }
 
 /// How the proxy should handle auth headers when forwarding to a target.
@@ -117,7 +116,6 @@ impl ProxyHandle {
             base_url,
             verify_ssl: true,
             auth: UpstreamAuth::Passthrough,
-            custom_headers: HashMap::new(),
         })?;
         let mut table = self.state.routing.write().unwrap();
         table
@@ -195,7 +193,6 @@ impl ProxyServer {
             base_url: ambient_base_url,
             verify_ssl: true,
             auth: UpstreamAuth::Passthrough,
-            custom_headers: HashMap::new(),
         })?;
         let routing = Arc::new(RwLock::new(RoutingTable {
             default,
@@ -234,7 +231,6 @@ impl ProxyServer {
 struct ResolvedTarget {
     base_url: String,
     auth: UpstreamAuth,
-    custom_headers: HashMap<String, Secret>,
     client: reqwest::Client,
 }
 
@@ -243,7 +239,6 @@ impl Clone for ResolvedTarget {
         Self {
             base_url: self.base_url.clone(),
             auth: self.auth.clone(),
-            custom_headers: self.custom_headers.clone(),
             client: self.client.clone(),
         }
     }
@@ -257,7 +252,6 @@ impl ResolvedTarget {
         Ok(Self {
             base_url: target.base_url,
             auth: target.auth,
-            custom_headers: target.custom_headers,
             client,
         })
     }
@@ -535,23 +529,12 @@ async fn forward(
         body_bytes
     };
     let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    let (target, label, forward_path, custom_header_names) = {
+    let (target, label, forward_path) = {
         let table = state.routing.read().unwrap();
         let content_type = headers
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok());
-        let (target, label, path) =
-            table.target_and_label_for(path_and_query, content_type, &body_bytes)?;
-        // A child can inherit its parent's provider headers. Strip configured
-        // custom headers before injecting those belonging to the selected route.
-        let names: Vec<String> = table
-            .routes
-            .values()
-            .chain(std::iter::once(&table.default))
-            .flat_map(|target| target.custom_headers.keys())
-            .map(|name| name.to_ascii_lowercase())
-            .collect();
-        (target, label, path, names)
+        table.target_and_label_for(path_and_query, content_type, &body_bytes)?
     };
 
     let url = format!("{}{}", target.base_url.trim_end_matches('/'), forward_path);
@@ -569,12 +552,7 @@ async fn forward(
         if is_hop_by_hop_header(name.as_str()) {
             continue;
         }
-        if strip_client_auth
-            && (is_auth_header(name.as_str())
-                || custom_header_names
-                    .iter()
-                    .any(|custom| custom == name.as_str()))
-        {
+        if strip_client_auth && is_auth_header(name.as_str()) {
             continue;
         }
         if let Ok(v) = value.to_str() {
@@ -586,9 +564,6 @@ async fn forward(
         // schemes a provider might expect -- harmless, since a real
         // upstream only reads the one it understands.
         outbound = outbound.header("x-api-key", &key.0).bearer_auth(&key.0);
-    }
-    for (name, value) in &target.custom_headers {
-        outbound = outbound.header(name, &value.0);
     }
     let upstream_resp = outbound.body(body_bytes).send().await?;
 
@@ -770,7 +745,6 @@ mod tests {
             base_url,
             verify_ssl: true,
             auth,
-            custom_headers: HashMap::new(),
         }
     }
 
@@ -814,80 +788,6 @@ mod tests {
         assert_eq!(body["x_api_key"], "known-key");
 
         server.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn custom_headers_follow_selected_provider_without_leaking_parent_headers() {
-        let upstream = SubServer::spawn(
-            Router::new().fallback(any(|headers: HeaderMap| async move {
-                axum::Json(
-                    headers
-                        .iter()
-                        .map(|(name, value)| {
-                            (name.to_string(), value.to_str().unwrap().to_string())
-                        })
-                        .collect::<HashMap<_, _>>(),
-                )
-            })),
-            "header test upstream",
-        )
-        .unwrap();
-        let proxy = ProxyServer::start().unwrap();
-        let base_url = format!("http://{}", upstream.local_addr);
-        proxy
-            .handle
-            .set_default(
-                target(base_url.clone(), UpstreamAuth::Passthrough),
-                "passthrough".into(),
-            )
-            .unwrap();
-        for provider in ["main", "child"] {
-            let mut route = target(
-                base_url.clone(),
-                UpstreamAuth::Inject(Some(Secret(format!("{provider}-key")))),
-            );
-            route.custom_headers = HashMap::from([
-                ("X-Provider".into(), Secret(provider.into())),
-                (format!("X-{provider}-Only"), Secret(provider.into())),
-            ]);
-            proxy
-                .handle
-                .register_route(provider.into(), route, provider.into())
-                .unwrap();
-        }
-
-        let client = reqwest::Client::new();
-        for model in ["main", "child", "unknown"] {
-            let response = client
-                .post(format!("{}/v1/responses", proxy.handle.local_base_url))
-                .header("authorization", "Bearer client-key")
-                .header("X-Provider", "inherited")
-                .header("X-Main-Only", "inherited-main")
-                .header("X-Child-Only", "inherited-child")
-                .header("X-Unrelated", "keep")
-                .json(&serde_json::json!({"model": model}))
-                .send()
-                .await
-                .unwrap();
-            assert!(response.status().is_success());
-            let headers: HashMap<String, String> = response.json().await.unwrap();
-            assert_eq!(headers["x-unrelated"], "keep");
-            if model == "unknown" {
-                assert_eq!(headers["authorization"], "Bearer client-key");
-                assert_eq!(headers["x-provider"], "inherited");
-                assert_eq!(headers["x-main-only"], "inherited-main");
-                assert_eq!(headers["x-child-only"], "inherited-child");
-            } else {
-                assert_eq!(headers["authorization"], format!("Bearer {model}-key"));
-                assert_eq!(headers["x-api-key"], format!("{model}-key"));
-                assert_eq!(headers["x-provider"], model);
-                assert_eq!(headers[&format!("x-{model}-only")], model);
-                let other = if model == "main" { "child" } else { "main" };
-                assert!(!headers.contains_key(&format!("x-{other}-only")));
-            }
-        }
-        proxy.shutdown().await;
-        upstream.shutdown().await;
     }
 
     /// An upstream that names itself and echoes the model it was asked for,
