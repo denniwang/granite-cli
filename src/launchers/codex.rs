@@ -654,8 +654,11 @@ impl CodexLauncher {
     /// registered from the generated root config so this never overwrites or
     /// obscures files in the user's `agents/` directory. Codex's `tools`
     /// field is a structured feature configuration, not a tool-name allow
-    /// list. Reject read-only tool lists because Codex ignores role-level
-    /// sandbox settings; other roles inherit the session's available tools.
+    /// list. Reject nonempty lists without FileWrite, FileEdit, or Shell
+    /// because Codex ignores role-level sandbox settings. Accepted roles
+    /// inherit the session's available tools and sandbox permissions;
+    /// individual tool restrictions are not enforced. Developer instructions
+    /// can guide tool use (e.g. read-only work), but cannot enforce it.
     /// See https://developers.openai.com/codex/subagents/#approvals-and-sandbox-controls.
     fn generate_sub_agent_files(&self, state_dir: &Path) -> anyhow::Result<Vec<(PathBuf, String)>> {
         self.bound_sub_agents
@@ -668,6 +671,7 @@ impl CodexLauncher {
                             tool,
                             crate::capabilities::ToolName::FileWrite
                                 | crate::capabilities::ToolName::FileEdit
+                                | crate::capabilities::ToolName::Shell
                         )
                     });
                 anyhow::ensure!(
@@ -1375,7 +1379,7 @@ mod tests {
     }
 
     #[test]
-    fn sub_agent_tool_lists_cannot_silently_grant_write_access() {
+    fn sub_agent_tool_lists_without_write_capable_tools_are_rejected() {
         let mut l = launcher();
         l.bound_sub_agents.push((
             "reviewer".into(),
@@ -1389,8 +1393,8 @@ mod tests {
         ));
         for tools in [
             vec![ToolName::FileRead, ToolName::Search],
-            vec![ToolName::Shell],
             vec![ToolName::WebSearch],
+            vec![ToolName::FileRead, ToolName::WebSearch],
         ] {
             l.bound_sub_agents[0].1.tools = tools;
             let error = l.generate_sub_agent_files(Path::new("state")).unwrap_err();
@@ -1401,11 +1405,27 @@ mod tests {
                 "{error}"
             );
         }
-        for tools in [vec![], vec![ToolName::FileWrite], vec![ToolName::FileEdit]] {
+        for tools in [
+            vec![],
+            vec![ToolName::FileWrite],
+            vec![ToolName::FileEdit],
+            vec![ToolName::Shell],
+            // Built-in explore and plan tool lists must both launch.
+            vec![ToolName::FileRead, ToolName::Search, ToolName::Shell],
+            vec![
+                ToolName::FileRead,
+                ToolName::Search,
+                ToolName::FileSearch,
+                ToolName::Shell,
+                ToolName::WebFetch,
+                ToolName::WebSearch,
+            ],
+        ] {
             l.bound_sub_agents[0].1.tools = tools;
             let roles = l.generate_sub_agent_files(Path::new("state")).unwrap();
             assert_eq!(roles.len(), 1);
             assert!(!roles[0].1.contains("sandbox_mode"));
+            assert!(!roles[0].1.contains("tools ="));
         }
     }
 
